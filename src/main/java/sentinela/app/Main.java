@@ -28,6 +28,7 @@ public final class Main {
                 case "schema" -> SchemaApp.run(rest);
                 case "ingestor" -> IngestorApp.run(rest);
                 case "leitor" -> ReaderApp.run(rest);
+                case "backfill" -> BackfillApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
