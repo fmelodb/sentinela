@@ -75,7 +75,9 @@ public final class IngestorApp {
                     System.currentTimeMillis());
             meta.put("dataset", dataset.toString());
             RunMeta.write(log, meta);
-            LoadRunner.Result r = new LoadRunner<>(source, steps, tps, Duration.ofSeconds(duration), threads, csv, errors).run();
+            LoadRunner.Result r = new LoadRunner<>(source, steps, tps, Duration.ofSeconds(duration), Duration.ofSeconds(warmup), threads,
+                    csv, errors).run();
+            LoadPaths.recordLag(log, "ingestor", r);
             RunMeta.put(log, "end_epoch_ms", Long.toString(System.currentTimeMillis()));
             System.err.printf("ingestor: %d transações despachadas, %d erro(s) -> %s%n", r.dispatched(), errors.total(), log);
             if (r.sourceExhausted()) {

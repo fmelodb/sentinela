@@ -36,6 +36,7 @@ class OracleMaintenanceIT {
     static void setUp() {
         env = Env.fromSystem();
         assumeTrue(env.oracleUrl() != null, "ORACLE_URL ausente");
+        sentinela.testsupport.DestructiveGuard.assumeAllowed(env);
         ds = OracleDataSources.pool(env, "it-maint", 2, 1000, OracleDataSources.NO_TIMEOUT);
         m = new OracleMaintenance(ds, env.zone());
         store = new OracleFeatureStore(ds, env.zone());

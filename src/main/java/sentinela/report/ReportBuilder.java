@@ -12,6 +12,8 @@ import java.util.stream.Collectors;
 public final class ReportBuilder {
     static final double MAX_TPS_DEVIATION = 0.05;
     static final double MAX_ERROR_RATE = 0.001;
+    /** Fração máxima de inícios atrasados (fila) após o warmup antes de a rodada ser marcada. */
+    static final double MAX_LATE_START_RATE = 0.01;
 
     private ReportBuilder() {}
 
@@ -85,6 +87,16 @@ public final class ReportBuilder {
         return new GroupStats(f.run(), f.startMs(), sample.program(), sample.mode(), op,
                 lat.length, errors, errorRate, durationS, target, achieved, deviation,
                 lat[0], avg, Stats.nearestRank(lat, 950), Stats.nearestRank(lat, 990), lat[lat.length - 1],
-                deviation < MAX_TPS_DEVIATION, errorRate < MAX_ERROR_RATE);
+                deviation < MAX_TPS_DEVIATION, errorRate < MAX_ERROR_RATE,
+                f.maxStartLagMs(), lagOk(f));
+    }
+
+    private static boolean lagOk(LogFile f) {
+        long measured = f.measuredStarts();
+        long late = f.lateStarts();
+        if (measured < 0 || late < 0) {
+            return true; // log sem medição de fila
+        }
+        return late <= MAX_LATE_START_RATE * measured;
     }
 }

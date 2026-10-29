@@ -31,8 +31,8 @@ public final class ReportWriter {
         byRun.forEach((run, groups) -> {
             sb.append("\n## Execução ").append(run).append("\n\n");
             sb.append("| Programa | Modo | Operação | Ops | Erros | Taxa de erro | Duração (s) | TPS alvo | TPS alcançado"
-                    + " | Desvio | min | avg | p95 | p99 | max | TPS ok | Erro ok |\n");
-            sb.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+                    + " | Desvio | min | avg | p95 | p99 | max | TPS ok | Erro ok | Atraso máx (ms) | Fila ok |\n");
+            sb.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | --- |\n");
             for (GroupStats g : groups) {
                 sb.append("| ").append(g.program()).append(" | ").append(g.mode()).append(" | ").append(g.operation())
                         .append(" | ").append(g.ops()).append(" | ").append(g.errors())
@@ -43,6 +43,8 @@ public final class ReportWriter {
                         .append(" | ").append(ms(g.p95Us())).append(" | ").append(ms(g.p99Us()))
                         .append(" | ").append(ms(g.maxUs()))
                         .append(" | ").append(g.tpsOk() ? "sim" : "NÃO").append(" | ").append(g.errorOk() ? "sim" : "NÃO")
+                        .append(" | ").append(g.maxStartLagMs() < 0 ? "—" : Long.toString(g.maxStartLagMs()))
+                        .append(" | ").append(g.lagOk() ? "sim" : "NÃO")
                         .append(" |\n");
             }
         });
@@ -52,13 +54,14 @@ public final class ReportWriter {
 
     public static String csv(List<GroupStats> stats) {
         StringBuilder sb = new StringBuilder("run,program,mode,operation,ops,errors,error_rate,duration_s,target_tps,"
-                + "achieved_tps,deviation,min_ms,avg_ms,p95_ms,p99_ms,max_ms,tps_ok,err_ok\n");
+                + "achieved_tps,deviation,min_ms,avg_ms,p95_ms,p99_ms,max_ms,tps_ok,err_ok,max_start_lag_ms,lag_ok\n");
         for (GroupStats g : stats) {
             sb.append(String.join(",", g.run(), g.program(), g.mode(), g.operation(),
                     Long.toString(g.ops()), Long.toString(g.errors()), fmt(g.errorRate(), 6), fmt(g.durationS(), 3),
                     Integer.toString(g.targetTps()), fmt(g.achievedTps(), 2), fmt(g.deviation(), 6),
                     ms(g.minUs()), ms(g.avgUs()), ms(g.p95Us()), ms(g.p99Us()), ms(g.maxUs()),
-                    Boolean.toString(g.tpsOk()), Boolean.toString(g.errorOk()))).append('\n');
+                    Boolean.toString(g.tpsOk()), Boolean.toString(g.errorOk()),
+                    Long.toString(g.maxStartLagMs()), Boolean.toString(g.lagOk()))).append('\n');
         }
         return sb.toString();
     }

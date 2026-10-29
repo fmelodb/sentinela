@@ -1,5 +1,6 @@
 package sentinela.app;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.file.Path;
@@ -8,6 +9,8 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import sentinela.infra.RunMeta;
+import sentinela.workload.LoadRunner;
 
 /** Nomes de execução e de log, e o conteúdo do .meta.properties de Ingestor e Leitor. */
 final class LoadPaths {
@@ -38,6 +41,16 @@ final class LoadPaths {
         m.put("host", host() + " (" + Runtime.getRuntime().availableProcessors() + " CPUs, heap máx "
                 + Runtime.getRuntime().maxMemory() / (1024 * 1024) + " MB)");
         return m;
+    }
+
+    /** Grava no .meta a medição de fila do LoadRunner, que o Relatório usa na coluna "Fila ok". */
+    static void recordLag(Path log, String program, LoadRunner.Result r) throws IOException {
+        RunMeta.put(log, "measured_starts", Long.toString(r.measuredStarts()));
+        RunMeta.put(log, "late_starts", Long.toString(r.lateStarts()));
+        RunMeta.put(log, "max_start_lag_ms", Long.toString(r.maxStartLagMs()));
+        RunMeta.put(log, "late_threshold_ms", Long.toString(LoadRunner.LATE_THRESHOLD_MS));
+        System.err.printf("%s: fila após o warmup: %d de %d início(s) com atraso > %d ms; atraso máximo %d ms%n",
+                program, r.lateStarts(), r.measuredStarts(), LoadRunner.LATE_THRESHOLD_MS, r.maxStartLagMs());
     }
 
     private static String host() {

@@ -75,7 +75,8 @@ public final class ReaderApp {
             meta.put("seed", Long.toString(seed));
             RunMeta.write(log, meta);
             LoadRunner.Result r = new LoadRunner<>(source, java.util.List.of(step), tps, Duration.ofSeconds(duration),
-                    threads, csv, errors).run();
+                    Duration.ofSeconds(warmup), threads, csv, errors).run();
+            LoadPaths.recordLag(log, "leitor", r);
             RunMeta.put(log, "end_epoch_ms", Long.toString(System.currentTimeMillis()));
             System.err.printf("leitor: %d leituras despachadas, %d erro(s) -> %s%n", r.dispatched(), errors.total(), log);
             return ExitCodes.OK;

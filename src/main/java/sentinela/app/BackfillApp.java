@@ -4,11 +4,14 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import oracle.ucp.jdbc.PoolDataSource;
 import sentinela.adapter.oracle.OracleDataSources;
+import sentinela.adapter.oracle.OracleFeatureStore;
 import sentinela.adapter.oracle.OracleMaintenance;
+import sentinela.adapter.oracle.PlanCheck;
 import sentinela.adapter.valkey.LuaScripts;
 import sentinela.adapter.valkey.ValkeyConnections;
 import sentinela.adapter.valkey.ValkeyMaintenance;
@@ -80,6 +83,17 @@ public final class BackfillApp {
 
             om.gatherStats();
             step(t0, "estatísticas coletadas");
+
+            // Spec técnica 5.3: confere o plano real da leitura sobre o volume da rodada; plano errado invalida a rodada.
+            new OracleFeatureStore(ds, env.zone()).read(1, now);
+            List<String> plan = om.readPlan();
+            List<String> problems = PlanCheck.problems(plan);
+            if (!problems.isEmpty()) {
+                plan.forEach(System.err::println);
+                problems.forEach(p -> System.err.println("backfill: plano de leitura inválido: " + p));
+                return ExitCodes.INVALID_RUN;
+            }
+            step(t0, "plano de leitura ok (índice coberto, poda de partições, sem acesso à tabela)");
 
             if (vm != null) {
                 try (ValkeyMaintenance.SliceWriter w = vm.sliceWriter()) {

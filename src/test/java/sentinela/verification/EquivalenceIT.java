@@ -27,6 +27,7 @@ class EquivalenceIT {
     void bothAdaptersAndReferenceAgree() {
         Env env = Env.fromSystem();
         assumeTrue(env.oracleUrl() != null && env.valkeyUrl() != null, "ORACLE_URL ou VALKEY_URL ausente");
+        sentinela.testsupport.DestructiveGuard.assumeAllowed(env);
         PoolDataSource ds = OracleDataSources.pool(env, "it-equivalencia", 2, 1000, OracleDataSources.NO_TIMEOUT);
         try (ValkeyConnections valkey = ValkeyConnections.open(env);
                 StatefulRedisConnection<String, String> bulk = valkey.openBulk()) {

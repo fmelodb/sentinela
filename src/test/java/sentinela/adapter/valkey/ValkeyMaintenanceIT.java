@@ -37,6 +37,7 @@ class ValkeyMaintenanceIT {
     static void setUp() {
         env = Env.fromSystem();
         assumeTrue(env.valkeyUrl() != null, "VALKEY_URL ausente");
+        sentinela.testsupport.DestructiveGuard.assumeAllowed(env);
         conns = ValkeyConnections.open(env);
         bulk = conns.openBulk();
         LuaScripts scripts = new LuaScripts();

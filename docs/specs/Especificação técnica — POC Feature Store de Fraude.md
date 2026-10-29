@@ -268,7 +268,7 @@ CROSS JOIN (
 
 São 19 + 6 binds, gerados no mesmo laço que gera o texto. O resultado é uma linha com 76 colunas. O mapeamento para `WindowAgg`: `COUNT` → `cnt`; `SUM` nulo vira 0; `SUM`, `MIN` e `MAX` são convertidos para centavos com `movePointRight(2).longValueExact()`; `SUM(cnt)` nulo nas janelas de dia vira 0.
 
-Plano esperado, conferido uma vez com `DBMS_XPLAN` após o Backfill: `PARTITION RANGE ITERATOR` sobre `INDEX RANGE SCAN TX_ACC_TS_AMT_IX`, sem acesso à tabela, mais `INDEX RANGE SCAN DAILY_AGG_PK`. Se o plano for outro, a rodada não vale.
+Plano esperado, conferido automaticamente pelo Backfill depois da coleta de estatísticas (uma leitura real e `DBMS_XPLAN.DISPLAY_CURSOR`): `PARTITION RANGE ITERATOR` sobre `INDEX RANGE SCAN TX_ACC_TS_AMT_IX`, sem acesso à tabela, mais `INDEX RANGE SCAN DAILY_AGG_PK`. Se o plano for outro, o Backfill imprime o plano e sai com código 4 (rodada inválida).
 
 ### 5.4 Ingestão
 
@@ -422,7 +422,7 @@ record Step<T>(String operation, Consumer<T> call, ToLongFunction<T> accountOf) 
 
 Dimensionamento: `--threads` precisa satisfazer `threads ≥ tps × latência_média_s`, com folga. O default 8 a 600 TPS aguenta latência média de até 13 ms por operação completa (no modo `oracle+valkey`, a soma dos dois sinks).
 
-Limitação conhecida, registrada para quem ler os números: o tempo que a operação passa na fila não entra em `latency_us` (*coordinated omission*). Por isso o critério de TPS sustentado (±5%) é o detector de saturação: se o sistema não acompanha, o TPS cai antes de o percentil mentir.
+Limitação conhecida, registrada para quem ler os números: o tempo que a operação passa na fila não entra em `latency_us` (*coordinated omission*). O critério de TPS sozinho não basta para detectar saturação: depois de um travamento, o despachante emite em rajada e os workers esvaziam a fila dentro da janela medida, de modo que o TPS volta ao alvo e a espera não aparece em lugar nenhum (na rodada de aceitação local, cerca de 10 s de fila acumulada no warmup apareceram só como 622 TPS para um alvo de 600). Por isso os workers medem, à parte, o atraso entre o instante agendado de cada item e o início real da execução, contando só os itens que começam depois do warmup. O resultado vai para o `.meta.properties` (`measured_starts`, `late_starts` com atraso acima de 100 ms, `max_start_lag_ms`) e o Relatório marca a rodada com `Fila ok = NÃO` quando mais de 1% dos inícios atrasou.
 
 ## 9. Programas
 
@@ -491,7 +491,7 @@ Argumento único: o diretório de logs. Lê todo `*.csv` que tenha um `.meta.pro
 | Desvio de TPS | `|alcançado − alvo| / alvo`, com o alvo vindo do `.meta` |
 | Percentis | Nearest-rank sem interpolação: com a amostra ordenada, valor na posição `ceil(q × n)` (base 1) |
 | Unidade | Milissegundos com uma casa, `HALF_UP` |
-| Critérios de carga | Colunas `tps_ok` (desvio < 5%) e `erro_ok` (taxa < 0,1%) |
+| Critérios de carga | Colunas `tps_ok` (desvio < 5%), `erro_ok` (taxa < 0,1%) e `lag_ok` (no máximo 1% dos inícios após o warmup com atraso de fila acima de 100 ms; seção 8), mais `max_start_lag_ms` |
 
 Saídas:
 
@@ -626,7 +626,7 @@ Subir de 100 mil para 300 mil contas muda só `--accounts`.
 
 ### 12.2 Integração (`mvn verify -Pintegration`)
 
-Testes com a tag `integration`. Só rodam com `ORACLE_URL` e `VALKEY_URL` definidas, contra o pod local. Contêm:
+Testes com a tag `integration`. Só rodam com `ORACLE_URL` e `VALKEY_URL` definidas. Os destrutivos (que esvaziam `TX`, `DAILY_AGG` ou o Valkey) só rodam se os dois apontarem para `localhost`, ou com `FS_IT_DESTRUCTIVE=1` explícito, para nunca apagarem um ambiente remoto por engano. Contêm:
 
 - `EquivalenceIT`: chama a mesma classe `EquivalenceCheck` do programa `equivalencia`, com 1.000 contas;
 - teste de cada script Lua isolado: fatia nova, combinação e limpeza da retenção;

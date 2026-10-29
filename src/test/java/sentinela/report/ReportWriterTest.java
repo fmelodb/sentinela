@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 class ReportWriterTest {
     private static GroupStats g(String run, long start, String program, String mode, String op, double avgUs) {
         return new GroupStats(run, start, program, mode, op, 1000, 0, 0.0, 100.0, 10, 10.0, 0.0,
-                500, avgUs, 1500, 2500, 9000, true, true);
+                500, avgUs, 1500, 2500, 9000, true, true, 250, true);
     }
 
     @Test
@@ -27,6 +27,7 @@ class ReportWriterTest {
         assertTrue(md.contains("## Execução r1"));
         assertTrue(md.contains("## Execução r2"));
         assertTrue(md.contains("## Comparação dos modos"));
+        assertTrue(md.contains("| Atraso máx (ms) | Fila ok |"), md);
         assertTrue(md.contains("| read | avg (ms) | 4.0 | 0.8 |"), md);
         assertTrue(md.contains("| ingest_valkey | avg (ms) | — | 0.3 |"), md);
     }
@@ -53,6 +54,8 @@ class ReportWriterTest {
         assertEquals(2, lines.length);
         assertTrue(lines[0].startsWith("run,program,mode,operation,ops,errors"));
         assertTrue(lines[1].startsWith("r1,reader,oracle,read,1000,0,"));
+        assertTrue(lines[0].endsWith(",max_start_lag_ms,lag_ok"), lines[0]);
+        assertTrue(lines[1].endsWith(",250,true"), lines[1]);
     }
 
     @Test

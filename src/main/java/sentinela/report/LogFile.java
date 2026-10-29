@@ -20,4 +20,18 @@ public record LogFile(Path csv, Properties meta, List<LogRow> rows) {
     public int targetTps() {
         return Integer.parseInt(meta.getProperty("tps"));
     }
+
+    /** Itens que começaram depois do warmup; -1 se o log não traz a medição de fila. */
+    public long measuredStarts() {
+        return Long.parseLong(meta.getProperty("measured_starts", "-1"));
+    }
+
+    /** Itens que começaram mais de LoadRunner.LATE_THRESHOLD_MS depois do agendado; -1 se ausente. */
+    public long lateStarts() {
+        return Long.parseLong(meta.getProperty("late_starts", "-1"));
+    }
+
+    public long maxStartLagMs() {
+        return Long.parseLong(meta.getProperty("max_start_lag_ms", "-1"));
+    }
 }

@@ -73,6 +73,35 @@ class ReportBuilderTest {
     }
 
     @Test
+    void hiddenQueueingFailsLagCheck(@TempDir Path dir) throws Exception {
+        Path csv = LogFixtures.readerLog(dir, "oracle", "r1", LogFixtures.START);
+        RunMeta.put(csv, "measured_starts", "1000");
+        RunMeta.put(csv, "late_starts", "50");
+        RunMeta.put(csv, "max_start_lag_ms", "900");
+        GroupStats g = ReportBuilder.build(LogLoader.load(dir, warn), warn).get(0);
+        assertEquals(900, g.maxStartLagMs());
+        assertFalse(g.lagOk(), "5% dos inícios atrasados reprova a fila");
+        assertTrue(g.tpsOk(), "o TPS sozinho não percebe a fila");
+    }
+
+    @Test
+    void logsWithoutLagMetadataAreNotFlagged(@TempDir Path dir) throws Exception {
+        LogFixtures.readerLog(dir, "oracle", "r1", LogFixtures.START);
+        GroupStats g = ReportBuilder.build(LogLoader.load(dir, warn), warn).get(0);
+        assertEquals(-1, g.maxStartLagMs());
+        assertTrue(g.lagOk());
+    }
+
+    @Test
+    void rowsShareRepeatedStringsToBoundMemory(@TempDir Path dir) throws Exception {
+        LogFixtures.readerLog(dir, "oracle", "r1", LogFixtures.START);
+        List<LogRow> rows = LogLoader.load(dir, warn).get(0).rows();
+        assertSame(rows.get(0).program(), rows.get(1).program());
+        assertSame(rows.get(0).mode(), rows.get(1).mode());
+        assertSame(rows.get(0).operation(), rows.get(1).operation());
+    }
+
+    @Test
     void seriesCountsOkOperationsPerSecondFillingGaps(@TempDir Path dir) throws Exception {
         LogFixtures.readerLog(dir, "oracle", "r1", LogFixtures.START);
         List<SeriesRow> series = ReportBuilder.series(LogLoader.load(dir, warn));

@@ -46,7 +46,9 @@ public final class LogLoader {
                     if (f.length != 7) {
                         throw new NumberFormatException("colunas: " + f.length);
                     }
-                    rows.add(new LogRow(Long.parseLong(f[0]), f[1], f[2], f[3], Long.parseLong(f[4]),
+                    // intern(): programa, modo e operação se repetem em todas as linhas; sem isso,
+                    // cada linha retém três Strings novas e vários runs estouram o heap do relatório.
+                    rows.add(new LogRow(Long.parseLong(f[0]), f[1].intern(), f[2].intern(), f[3].intern(), Long.parseLong(f[4]),
                             Long.parseLong(f[5]), f[6].equals("ok")));
                 } catch (NumberFormatException e) {
                     bad++;
