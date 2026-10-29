@@ -294,7 +294,7 @@ Uma linha por chamada, com autocommit. `SQLIntegrityConstraintViolationException
 | --- | --- | --- |
 | `closeDay(D)` | Numa transação: `DELETE FROM daily_agg WHERE dia = :D`; `INSERT INTO daily_agg SELECT account_id, :D, COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM tx WHERE ts >= :ini AND ts < :fim GROUP BY account_id` | Job diário, Backfill, Equivalência |
 | `checkDay(D)` | Diferença simétrica (`MINUS` nos dois sentidos) entre `DAILY_AGG` do dia e o recálculo sobre `TX`; espera 0 linhas | Equivalência |
-| `dropOldPartitions(hoje)` | Para cada partição com `partition_position > 1` e limite superior ≤ início UTC de `hoje − 93`: `ALTER TABLE tx DROP PARTITION <nome> UPDATE GLOBAL INDEXES`. O limite vem de `USER_TAB_PARTITIONS.HIGH_VALUE_CLOB` | Job diário |
+| `dropOldPartitions(hoje)` | Para cada partição com `partition_position > 1` e limite superior ≤ início UTC de `hoje − 93`: `ALTER TABLE tx DROP PARTITION <nome> UPDATE GLOBAL INDEXES`. O limite vem de `USER_TAB_PARTITIONS.HIGH_VALUE` (coluna LONG, lida como texto pelo JDBC) | Job diário |
 | `reset()` | `TRUNCATE TABLE tx DROP ALL STORAGE`; `TRUNCATE TABLE daily_agg` | Backfill, Equivalência |
 | `gatherStats()` | `DBMS_STATS.GATHER_TABLE_STATS` em `TX` e `DAILY_AGG` | Backfill, ao final |
 
@@ -547,6 +547,7 @@ Passos:
 | 2 | Argumento ou variável de ambiente inválida |
 | 3 | Store indisponível na inicialização |
 | 4 | Rodada inválida (dataset esgotado antes do fim) |
+| 5 | Erro inesperado (I/O, falha não prevista), com stack trace em `stderr` |
 
 ## 10. Logs
 
