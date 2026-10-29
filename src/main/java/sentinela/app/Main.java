@@ -25,6 +25,7 @@ public final class Main {
             return switch (argv[0]) {
                 case "gerador" -> GeneratorApp.run(rest);
                 case "relatorio" -> ReportApp.run(rest);
+                case "schema" -> SchemaApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
