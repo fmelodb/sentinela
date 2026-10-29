@@ -49,9 +49,9 @@ public record FeatureVector(List<WindowAgg> aggs) {
 
     private static List<String> buildNames() {
         List<String> names = new ArrayList<>();
-        for (Window w : WindowCatalog.WINDOWS) {
+        for (String suffix : WindowCatalog.SUFFIXES) {
             for (String m : METRICS) {
-                names.add(m + "_" + w.suffix());
+                names.add(m + "_" + suffix);
             }
         }
         return List.copyOf(names);
