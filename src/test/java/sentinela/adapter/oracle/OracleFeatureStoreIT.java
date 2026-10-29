@@ -9,6 +9,7 @@ import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import oracle.ucp.jdbc.PoolDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -60,36 +61,61 @@ class OracleFeatureStoreIT {
         assertEquals(FeatureVector.empty(), store.read(ACC, Instant.now().truncatedTo(ChronoUnit.MICROS)));
     }
 
+    private static Instant now() {
+        return Instant.now().truncatedTo(ChronoUnit.MICROS);
+    }
+
     @Test
-    void readsMinuteAndHourWindowsAndIgnoresDuplicates() {
-        Instant now = Instant.now().truncatedTo(ChronoUnit.MINUTES).plusSeconds(30);
-        store.ingest(new Transaction(9_900_000_001L, ACC, now.minusSeconds(10), 1000));
-        store.ingest(new Transaction(9_900_000_002L, ACC, now.minus(2, ChronoUnit.HOURS), 2000));
-        store.ingest(new Transaction(9_900_000_003L, ACC, now.minus(30, ChronoUnit.HOURS), 3000));
+    void readsRollingWindowsAndIgnoresDuplicates() {
+        Instant now = now();
+        Transaction t1 = new Transaction(9_900_000_001L, ACC, now.minusSeconds(10), 1000);
+        Transaction t2 = new Transaction(9_900_000_002L, ACC, now.minus(2, ChronoUnit.HOURS).plusSeconds(1), 2000);
+        Transaction t3 = new Transaction(9_900_000_003L, ACC, now.minus(30, ChronoUnit.HOURS), 3000);
+        store.ingest(t1);
+        store.ingest(t2);
+        store.ingest(t3);
         long before = store.duplicates();
-        store.ingest(new Transaction(9_900_000_001L, ACC, now.minusSeconds(10), 1000));
+        store.ingest(t1);
         assertEquals(before + 1, store.duplicates());
 
         FeatureVector v = store.read(ACC, now);
         assertEquals(WindowAgg.of(1000), v.agg(0), "1m");
         assertEquals(WindowAgg.of(1000), v.agg(5), "1h");
-        assertEquals(WindowAgg.of(1000), v.agg(6), "2h = hora corrente e a anterior");
-        assertEquals(new WindowAgg(2, 3000, 1000L, 2000L), v.agg(7), "3h");
+        assertEquals(new WindowAgg(2, 3000, 1000L, 2000L), v.agg(6), "2h = exatamente as últimas 2 horas");
         assertEquals(new WindowAgg(2, 3000, 1000L, 2000L), v.agg(12), "24h");
         assertEquals(new WindowAgg(3, 6000, 1000L, 3000L), v.agg(13), "48h");
-        assertEquals(WindowAgg.EMPTY, v.agg(15), "7d sem DAILY_AGG");
+        long today = WindowCatalog.epochDay(now, env.zone());
+        WindowAgg todays = List.of(t1, t2, t3).stream().filter(t -> WindowCatalog.epochDay(t.ts(), env.zone()) == today)
+                .map(t -> WindowAgg.of(t.amountCents())).reduce(WindowAgg.EMPTY, WindowAgg::plus);
+        assertEquals(todays, v.agg(15), "7d sem DAILY_AGG = só o dia corrente");
     }
 
     @Test
-    void readsDayWindowsFromDailyAggExcludingToday() throws Exception {
-        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
-        long today = WindowCatalog.epochDay(now, env.zone());
-        insertDaily(today - 1, 2, "5.00", "1.00", "4.00");
-        insertDaily(today - 8, 1, "0.50", "0.50", "0.50");
-        insertDaily(today, 9, "90.00", "10.00", "10.00");
+    void rollingLowerBoundIsExclusiveAndUpperInclusive() {
+        Instant now = now();
+        Instant lo5m = now.minus(5, ChronoUnit.MINUTES);
+        store.ingest(new Transaction(9_900_000_011L, ACC, lo5m, 100));
+        store.ingest(new Transaction(9_900_000_012L, ACC, lo5m.plusNanos(1_000), 200));
+        store.ingest(new Transaction(9_900_000_013L, ACC, now, 300));
+        store.ingest(new Transaction(9_900_000_014L, ACC, now.plusNanos(1_000), 400));
         FeatureVector v = store.read(ACC, now);
-        assertEquals(new WindowAgg(2, 500, 100L, 400L), v.agg(15), "7d");
-        assertEquals(new WindowAgg(3, 550, 50L, 400L), v.agg(16), "31d");
+        assertEquals(new WindowAgg(2, 500, 200L, 300L), v.agg(1), "5m");
+        assertEquals(new WindowAgg(3, 600, 100L, 300L), v.agg(2), "10m");
+    }
+
+    @Test
+    void dayWindowsCombineDailyAggWithToday() throws Exception {
+        Instant now = now();
+        long today = WindowCatalog.epochDay(now, env.zone());
+        Instant todayStart = WindowCatalog.dayStart(today, env.zone());
+        insertDaily(today - 1, 2, "5.00", "1.00", "4.00");
+        insertDaily(today - 7, 1, "0.50", "0.50", "0.50");
+        insertDaily(today, 9, "90.00", "10.00", "10.00");
+        store.ingest(new Transaction(9_900_000_021L, ACC, todayStart, 1000));
+        store.ingest(new Transaction(9_900_000_022L, ACC, todayStart.minusNanos(1_000), 7));
+        FeatureVector v = store.read(ACC, now);
+        assertEquals(new WindowAgg(3, 1500, 100L, 1000L), v.agg(15), "7d: T−1 e hoje; T−7 e a linha de hoje ficam fora");
+        assertEquals(new WindowAgg(4, 1550, 50L, 1000L), v.agg(16), "31d");
         assertEquals(0, v.agg(0).cnt(), "DAILY_AGG não alimenta minutos");
     }
 

@@ -19,7 +19,7 @@ import sentinela.domain.WindowAgg;
 import sentinela.domain.WindowCatalog;
 import sentinela.infra.StoreException;
 
-/** Oracle como store: TX bruta e DAILY_AGG; leitura em um único statement. */
+/** Oracle como store: TX e DAILY_AGG; leitura em um único statement (spec técnica 5.3). */
 public final class OracleFeatureStore implements FeatureStorePort {
     /** Início do SQL de leitura como o Oracle o guarda em V$SQL (o JDBC troca ? por :n). */
     public static final String READ_SQL_PREFIX = "WITH b AS (SELECT :1 AS lo_1m";
@@ -56,7 +56,7 @@ public final class OracleFeatureStore implements FeatureStorePort {
 
     @Override
     public FeatureVector read(long accountId, Instant now) {
-        Object[] binds = OracleReadSql.binds(accountId, WindowCatalog.bounds(now, zone));
+        Object[] binds = OracleReadSql.binds(accountId, WindowCatalog.limits(now, zone));
         try (Connection c = ds.getConnection(); PreparedStatement ps = c.prepareStatement(OracleReadSql.SQL)) {
             for (int i = 0; i < binds.length; i++) {
                 ps.setObject(i + 1, binds[i]);
@@ -64,21 +64,30 @@ public final class OracleFeatureStore implements FeatureStorePort {
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 List<WindowAgg> aggs = new ArrayList<>(WindowCatalog.SIZE);
-                for (int w = 0; w < WindowCatalog.SIZE; w++) {
-                    int base = w * 4 + 1;
-                    long cnt = rs.getLong(base);
-                    if (cnt == 0) {
-                        aggs.add(WindowAgg.EMPTY);
-                    } else {
-                        aggs.add(new WindowAgg(cnt, cents(rs.getBigDecimal(base + 1)),
-                                cents(rs.getBigDecimal(base + 2)), cents(rs.getBigDecimal(base + 3))));
-                    }
+                int col = 1;
+                for (int w = 0; w < WindowCatalog.ROLLING.size(); w++, col += 4) {
+                    aggs.add(agg(rs, col));
+                }
+                WindowAgg today = agg(rs, col);
+                col += 4;
+                for (int j = 0; j < WindowCatalog.DAYS.size(); j++, col += 4) {
+                    aggs.add(agg(rs, col).plus(today)); // dias fechados + dia corrente (spec técnica 5.3)
                 }
                 return new FeatureVector(aggs);
             }
         } catch (SQLException e) {
             throw new StoreException("read no Oracle, conta " + accountId, e);
         }
+    }
+
+    /** Quatro colunas a partir de base: cnt (COUNT ou SUM, nulo vira 0), sum, min, max. */
+    private static WindowAgg agg(ResultSet rs, int base) throws SQLException {
+        long cnt = rs.getLong(base);
+        if (cnt == 0) {
+            return WindowAgg.EMPTY;
+        }
+        return new WindowAgg(cnt, cents(rs.getBigDecimal(base + 1)), cents(rs.getBigDecimal(base + 2)),
+                cents(rs.getBigDecimal(base + 3)));
     }
 
     public long duplicates() {
