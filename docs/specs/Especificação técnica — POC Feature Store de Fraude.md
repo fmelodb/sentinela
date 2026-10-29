@@ -42,6 +42,7 @@ Tudo o que esta spec acrescenta ou ajusta, para revisão explícita:
 | 10 | Janela de `TX` no Backfill | Últimas 72h | De 00:00 (local) de D-3 até o instante do Backfill | Cobre 72h e permite que `DAILY_AGG` de D-3 a D-1 saia de `TX` pelo SQL do Job |
 | 11 | Retenção de `TX` | `DROP PARTITION` | Executado pelo Job diário | A funcional não diz quem faz |
 | 12 | Variável de ambiente | — | `FS_ZONE` | Fuso do dia civil |
+| 13 | Banco local | Oracle Database 26ai Free | Oracle Database 26ai Enterprise Edition (`container-registry.oracle.com/database/enterprise`), PDB `SENTINELA` | Decisão do usuário: sem os limites de 2 CPUs, 2 GB e 12 GB do Free, e mais perto do motor do ATP-S |
 
 ## 2. Stack e versões
 
@@ -563,14 +564,14 @@ Passos:
 
 | Container | Imagem | Configuração |
 | --- | --- | --- |
-| `sentinela-oracle` | `container-registry.oracle.com/database/free`, tag 26ai fixada no script (nunca `latest`) | `ORACLE_PWD` vindo de `.env.local`; volume nomeado `sentinela-oradata` em `/opt/oracle/oradata`; serviço `FREEPDB1` |
+| `sentinela-oracle` | `container-registry.oracle.com/database/enterprise:latest` (Oracle Database 26ai Enterprise Edition). O script confere o label `release` da imagem e aborta se não for `23.26.x` | `ORACLE_SID=ORCLCDB`, `ORACLE_PDB=SENTINELA`, `ORACLE_PWD` vindo de `.env.local`, `INIT_SGA_SIZE=4096`, `INIT_PGA_SIZE=2048` (MB), `ORACLE_CHARACTERSET=AL32UTF8`; volume nomeado `sentinela-oradata` em `/opt/oracle/oradata`; serviço `SENTINELA` |
 | `sentinela-valkey` | `valkey/valkey:7.2` | `valkey-server --save "" --appendonly no`; demais parâmetros no default, para paridade com o OCI Cache |
 | `poc` (efêmero) | `sentinela-poc`, construída pelo `Containerfile` | `--rm --pod sentinela --env-file .env.local -v ${PWD}/data:/data -v ${PWD}/logs:/logs` |
 
 Todos ficam no pod `sentinela`, então se enxergam por `localhost`:
 
 ```
-ORACLE_URL=jdbc:oracle:thin:@//localhost:1521/FREEPDB1
+ORACLE_URL=jdbc:oracle:thin:@//localhost:1521/SENTINELA
 VALKEY_URL=redis://localhost:6379
 ```
 
@@ -599,14 +600,14 @@ Sequência completa dos cenários A e B: `ambiente.ps1 -Acao up`, depois `rodada
 
 ### 11.4 Recursos e volume
 
-A máquina podman precisa de pelo menos 4 CPUs e 8 GB. O Oracle Free se limita a 2 threads de CPU, 2 GB de RAM e 12 GB de dados de usuário.
+A Enterprise Edition não tem os limites de CPU, memória e dados da edição Free. A máquina podman precisa de pelo menos 8 CPUs e 16 GB: 6 GB para SGA e PGA do Oracle, mais o Valkey e os dois programas Java com 1 GB de heap cada. A criação inicial do banco leva de 10 a 20 minutos e só acontece uma vez, porque o volume persiste.
 
 | Escala | `TX` | `DAILY_AGG` | Oracle (dados + índices) | Valkey |
 | --- | --- | --- | --- | --- |
 | 100 mil contas | ~1,9 milhão de linhas | ~8 milhões | ~0,7 GB | < 1 GB |
 | 300 mil contas | ~5,6 milhões | ~25 milhões | ~2 GB | < 3 GB |
 
-As duas escalas cabem no limite do Free. Subir de 100 mil para 300 mil contas muda só `--accounts`.
+Subir de 100 mil para 300 mil contas muda só `--accounts`.
 
 ## 12. Testes e verificação
 
