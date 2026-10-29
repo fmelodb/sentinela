@@ -101,15 +101,18 @@ public final class EquivalenceCheck {
                 diff(acc, "oracle", vo, "referencia", vr).forEach(s -> add(orDetails, s));
             }
             int cls = EquivalenceData.accountClass(acc);
+            long accountTxs = byAccount.getOrDefault(acc, List.of()).size();
             for (int w = 0; w < WindowCatalog.SIZE; w++) {
                 boolean minuteWindow = w <= LAST_MINUTE_WINDOW;
                 boolean dayWindow = w >= WindowCatalog.FIRST_DAY_WINDOW;
-                String name = "cnt_" + WindowCatalog.WINDOWS.get(w).suffix();
+                String name = "cnt_" + WindowCatalog.SUFFIXES.get(w);
                 if (cls == EquivalenceData.SILENT_LAST_HOUR && minuteWindow && (vo.agg(w).cnt() != 0 || vv.agg(w).cnt() != 0)) {
                     add(silentDetails, "conta " + acc + " " + name + ": oracle=" + vo.agg(w).cnt() + " valkey=" + vv.agg(w).cnt());
                 }
-                if (cls == EquivalenceData.TODAY_ONLY && dayWindow && (vo.agg(w).cnt() != 0 || vv.agg(w).cnt() != 0)) {
-                    add(todayDetails, "conta " + acc + " " + name + ": oracle=" + vo.agg(w).cnt() + " valkey=" + vv.agg(w).cnt());
+                if (cls == EquivalenceData.TODAY_ONLY && dayWindow
+                        && (vo.agg(w).cnt() != accountTxs || vv.agg(w).cnt() != accountTxs)) {
+                    add(todayDetails, "conta " + acc + " " + name + ": esperado=" + accountTxs + " oracle="
+                            + vo.agg(w).cnt() + " valkey=" + vv.agg(w).cnt());
                 }
             }
         }
@@ -134,7 +137,7 @@ public final class EquivalenceCheck {
                 result("Oracle = Valkey nas 95 posições (" + accounts + " contas)", ovDetails),
                 result("Oracle = modelo de referência", orDetails),
                 result("sem transação na última hora: cnt = 0 nos minutos e em 1h", silentDetails),
-                result("janelas de dias não incluem o dia corrente", todayDetails),
+                result("janelas de dias incluem o dia corrente até now", todayDetails),
                 result("Job diário = recálculo direto sobre TX", jobDetails),
                 result("reaplicar a sequência no Oracle não altera os contadores", idemDetails)));
     }
