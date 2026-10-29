@@ -26,6 +26,8 @@ public final class Main {
                 case "gerador" -> GeneratorApp.run(rest);
                 case "relatorio" -> ReportApp.run(rest);
                 case "schema" -> SchemaApp.run(rest);
+                case "ingestor" -> IngestorApp.run(rest);
+                case "leitor" -> ReaderApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
