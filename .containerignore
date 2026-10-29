@@ -1,0 +1,7 @@
+.git
+target
+data
+logs
+docs
+.env.local
+.superpowers
