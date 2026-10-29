@@ -14,7 +14,7 @@ A spec técnica responde às decisões que a funcional delegou e fixa o desenho 
 | --- | --- | --- |
 | Versão LTS do Java | Java 25 (Eclipse Temurin) | LTS corrente; records, sealed e `SplittableRandom` bastam, sem dependência extra |
 | Ingestão atômica no Valkey: Lua ou Functions | Script Lua via `EVALSHA`, recarregado com `SCRIPT LOAD` se o servidor responder `NOSCRIPT` | O Valkey roda sem persistência, então Functions também somem no restart; Lua tem o mesmo custo e menos cerimônia |
-| Leitura no Valkey: no cliente Java ou em Lua | `HGETALL` e combinação das fatias em Java, pelo `SliceAggregator` do domínio | Mantém a definição das janelas só no domínio, como exige a seção 4 da funcional. Revisitar só se o payload dominar o p99 (seção 13) |
+| Leitura no Valkey: no cliente Java ou em Lua | `ZRANGE … BYSCORE` das transações de 72h e `HGETALL` dos dias fechados, enviados juntos, e combinação em Java pelo `WindowAggregator` do domínio | Mantém a definição das janelas só no domínio, como exige a seção 4 da funcional. Revisitar só se o payload dominar o p99 (seção 13) |
 
 ### 1.2 Decisões tomadas nesta spec
 
@@ -30,7 +30,7 @@ Tudo o que esta spec acrescenta ou ajusta, para revisão explícita:
 
 | # | Item | Funcional | Esta spec | Motivo |
 | --- | --- | --- | --- | --- |
-| 1 | Valor da fatia no Valkey | `3\|450.00\|20.00\|300.00` | `3\|45000\|2000\|30000` (centavos) | Aritmética exata em Lua (só tem `double`) e igualdade bit a bit no cenário C |
+| 1 | Valores no Valkey | Fatia `3\|450.00\|20.00\|300.00`, membro `98231\|450.00` | Fatia `3\|45000\|2000\|30000`, membro `98231\|45000` (centavos) | Inteiros exatos de ponta a ponta e igualdade bit a bit no cenário C |
 | 2 | Colunas de `DAILY_AGG` | `cnt`, `sum`, `min`, `max` | `cnt`, `sum_amount`, `min_amount`, `max_amount` | Evitar nomes de funções SQL como colunas |
 | 3 | Índice de `TX` | `(account_id, ts)` | `(account_id, ts, amount)` local | Índice coberto: a leitura não acessa a tabela |
 | 4 | Organização de `DAILY_AGG` | PK `(account_id, dia)` | Mesma PK, tabela index-organized | As 92 linhas de uma conta ficam contíguas na PK |
@@ -43,6 +43,7 @@ Tudo o que esta spec acrescenta ou ajusta, para revisão explícita:
 | 11 | Retenção de `TX` | `DROP PARTITION` | Executado pelo Job diário | A funcional não diz quem faz |
 | 12 | Variável de ambiente | — | `FS_ZONE` | Fuso do dia civil |
 | 13 | Banco local | Oracle Database 26ai Free | Oracle Database 26ai Enterprise Edition (`container-registry.oracle.com/database/enterprise`), PDB `SENTINELA` | Decisão do usuário: sem os limites de 2 CPUs, 2 GB e 12 GB do Free, e mais perto do motor do ATP-S |
+| 14 | Precisão das janelas deslizantes | Ao segundo | Ao microssegundo, a precisão de `TIMESTAMP(6)` | Atende "ao segundo" sem truncar o `ts` gravado; instantes com nanossegundos são truncados ao microssegundo no domínio (seção 4.1) |
 
 ## 2. Stack e versões
 
@@ -118,26 +119,33 @@ Não existe adapter composto. O Ingestor chama cada sink da lista em sequência 
 ### 4.1 Tipos
 
 ```java
-public record Transaction(long txId, long accountId, Instant ts, long amountCents) {}
+public record Transaction(long txId, long accountId, Instant ts, long amountCents) {}   // ts precisa estar em µs
 
 public interface FeatureStorePort {
     void ingest(Transaction tx);
     FeatureVector read(long accountId, Instant now);
 }
 
-public enum Unit { MINUTE, HOUR, DAY }
+public record RollingWindow(String suffix, Duration span) {}  // ("5m", 5 min), ("1h", 60 min), ("72h", 72 h)
 
-public record Window(String suffix, Unit unit, int n) {}       // ("5m", MINUTE, 5), ("1h", MINUTE, 60), ("24h", HOUR, 24), ("31d", DAY, 31)
+public record DayWindow(String suffix, int n) {}               // ("7d", 7): 6 dias fechados + hoje
 
-public record Bounds(Unit unit, long lo, long hi) {}          // índices epoch da unidade, ambos inclusivos
+public record Limits(
+    Instant now,                 // truncado ao µs; limite superior inclusivo de tudo
+    List<Instant> rollingLo,     // 15 itens: now − span, exclusivo
+    long today,                  // epoch day de now em FS_ZONE
+    Instant todayStart,          // 00:00 de today em FS_ZONE, inclusivo
+    List<Long> closedLo) {}      // 4 itens: today − (n − 1); dias fechados de closedLo a today − 1
 
 public record WindowAgg(long cnt, long sumCents, Long minCents, Long maxCents) {
     public static final WindowAgg EMPTY = new WindowAgg(0, 0, null, null);
     public WindowAgg plus(WindowAgg o) { ... }                 // soma, soma, menor, maior
 }
 
-public record Slice(Unit unit, long index, WindowAgg agg) {}
+public record DaySlice(long epochDay, WindowAgg agg) {}
 ```
+
+Instantes têm precisão de microssegundo no domínio: o construtor de `Transaction` rejeita `ts` com nanossegundos (quem cria a transação trunca, como o Ingestor já faz) e `WindowCatalog.limits` aplica `truncatedTo(ChronoUnit.MICROS)` em `now`. É a precisão de `TIMESTAMP(6)` e do score do Valkey, então Oracle, Valkey e o modelo de referência comparam exatamente o mesmo valor. Sem isso, um relógio com nanossegundos faria o Oracle arredondar o `ts` gravado e o Valkey truncá-lo.
 
 O port não lê relógio. Quem decide o instante é o chamador: o Ingestor monta a `Transaction` com `ts = clock.instant()`, o Leitor chama `read(conta, clock.instant())`, a Equivalência passa um instante lógico fixo. Os adapters nunca chamam `Instant.now()` nem `SYSTIMESTAMP`.
 
@@ -145,24 +153,25 @@ Operações de manutenção (Backfill, Job diário, reset) não fazem parte do p
 
 ### 4.2 Catálogo de janelas
 
-`WindowCatalog` é a única implementação da regra de alinhamento da seção 3 da funcional. Contém as 19 janelas em ordem fixa:
+`WindowCatalog` é a única implementação da regra da seção 3 da funcional no código de produção. Contém as 19 janelas em ordem fixa:
 
-| # | Sufixos | Unidade | `n` |
+| # | Sufixos | Tipo | Parâmetro |
 | --- | --- | --- | --- |
-| 0–4 | `1m`, `5m`, `10m`, `15m`, `30m` | MINUTE | 1, 5, 10, 15, 30 |
-| 5 | `1h` | MINUTE | 60 |
-| 6–14 | `2h`, `3h`, `5h`, `6h`, `9h`, `12h`, `24h`, `48h`, `72h` | HOUR | 2 … 72 |
-| 15–18 | `7d`, `31d`, `62d`, `92d` | DAY | 7, 31, 62, 92 |
+| 0–4 | `1m`, `5m`, `10m`, `15m`, `30m` | `RollingWindow` | `span` de 1, 5, 10, 15, 30 minutos |
+| 5–14 | `1h`, `2h`, `3h`, `5h`, `6h`, `9h`, `12h`, `24h`, `48h`, `72h` | `RollingWindow` | `span` de 1 … 72 horas |
+| 15–18 | `7d`, `31d`, `62d`, `92d` | `DayWindow` | `n` = 7, 31, 62, 92 |
 
-`WindowCatalog.bounds(Instant now, ZoneId zone)` devolve um `Bounds` por janela:
+`WindowCatalog.limits(Instant now, ZoneId zone)` devolve um `Limits`:
 
-| Unidade | Índice corrente | `lo` | `hi` |
-| --- | --- | --- | --- |
-| MINUTE | `M = floorDiv(now.epochSecond, 60)` | `M - (n - 1)` | `M` |
-| HOUR | `H = floorDiv(now.epochSecond, 3600)` | `H - (n - 1)` | `H` |
-| DAY | `T = LocalDate.ofInstant(now, zone).toEpochDay()` | `T - n` | `T - 1` |
+| Campo | Valor | Limite |
+| --- | --- | --- |
+| `now` | `now.truncatedTo(MICROS)` | Superior, inclusivo, de todas as janelas |
+| `rollingLo[i]` | `now − span_i` | Inferior, exclusivo |
+| `today` | `LocalDate.ofInstant(now, zone).toEpochDay()` | — |
+| `todayStart` | `LocalDate.ofEpochDay(today).atStartOfDay(zone)` | Inferior, inclusivo, do dia corrente |
+| `closedLo[j]` | `today − (n_j − 1)` | Dias fechados de `closedLo[j]` a `today − 1`, inclusivos |
 
-Minutos e horas são alinhados em UTC. Para fusos de hora cheia, como `America/Sao_Paulo` (UTC−3, sem horário de verão desde 2019), a fatia de hora UTC coincide com a hora local. Só o dia depende do fuso.
+As janelas deslizantes não dependem de fuso: `span` é uma `Duration`, então "24h" são 24 horas reais mesmo num dia de troca de horário. Só `today` e `todayStart` usam `FS_ZONE`. O dia corrente sempre começa depois de `now − 72h`, de modo que as transações de hoje estão sempre dentro da faixa que a leitura já busca.
 
 ### 4.3 Vetor de features
 
@@ -178,9 +187,17 @@ Representação dos valores em `values()`: `cnt` com escala 0; `sum`, `min` e `m
 
 Igualdade de vetores (cenário C) compara os 19 `WindowAgg`, que são inteiros exatos. O `avg` é derivado sempre pela mesma função, então não precisa de comparação própria.
 
-### 4.4 Combinação de fatias
+### 4.4 Combinação
 
-`SliceAggregator.aggregate(Iterable<Slice> slices, List<Bounds> bounds)` devolve o `FeatureVector`. Para cada janela, soma (`WindowAgg.plus`) as fatias da mesma unidade com `lo ≤ index ≤ hi`. Fatias fora de qualquer limite, inclusive as do futuro, são ignoradas. São no máximo 224 fatias × 19 janelas de comparação: não vale otimizar.
+`WindowAggregator.aggregate(Iterable<Transaction> recent, Iterable<DaySlice> days, Limits l)` devolve o `FeatureVector`. É usado pelo Adapter Valkey; o Adapter Oracle faz a mesma conta em SQL (seção 5.3).
+
+| Parte | Regra |
+| --- | --- |
+| Janela deslizante `i` | Soma (`WindowAgg.plus`) as transações com `rollingLo[i] < ts ≤ now` |
+| Dia corrente | Soma as transações com `todayStart ≤ ts ≤ now` |
+| Janela de dias `j` | Soma as fatias com `closedLo[j] ≤ epochDay ≤ today − 1` e, em seguida, o agregado do dia corrente |
+
+Transações e fatias fora de qualquer limite, inclusive as do futuro, são ignoradas. São até cerca de 1.000 transações × 16 comparações por leitura: não vale otimizar.
 
 ## 5. Adapter Oracle
 
@@ -224,12 +241,10 @@ Notas:
 
 A JVM roda com `-Duser.timezone=UTC`. Instantes são enviados ao JDBC como `LocalDateTime.ofInstant(i, ZoneOffset.UTC)` via `setObject`, e dias como `LocalDate`. Nunca `java.sql.Timestamp` com fuso implícito.
 
-| Bound do domínio | Valor no SQL |
+| Campo de `Limits` | Valor no SQL |
 | --- | --- |
-| MINUTE `lo` | `epochSecond = lo × 60` |
-| HOUR `lo` | `epochSecond = lo × 3600` |
-| Limite superior de `TX` | `(M + 1) × 60`, exclusivo (fim do minuto corrente) |
-| DAY `lo`, `hi` | `LocalDate.ofEpochDay(lo)`; o superior é `< LocalDate.ofEpochDay(T)` |
+| `rollingLo[i]`, `now`, `todayStart` | `TIMESTAMP` em UTC, via `LocalDateTime.ofInstant(i, ZoneOffset.UTC)` |
+| `closedLo[j]`, `today` | `LocalDate.ofEpochDay(…)` |
 
 ### 5.3 Leitura
 
@@ -240,19 +255,24 @@ WITH b AS (
   SELECT ? AS lo_1m, ? AS lo_5m, ? AS lo_10m, ? AS lo_15m, ? AS lo_30m, ? AS lo_1h,
          ? AS lo_2h, ? AS lo_3h, ? AS lo_5h, ? AS lo_6h, ? AS lo_9h, ? AS lo_12h,
          ? AS lo_24h, ? AS lo_48h, ? AS lo_72h,
+         ? AS lo_hoje,
          ? AS lo_7d, ? AS lo_31d, ? AS lo_62d, ? AS lo_92d
   FROM dual
 )
 SELECT t.*, d.*
 FROM (
   SELECT
-    COUNT(CASE WHEN x.ts >= b.lo_1m THEN 1 END)        AS cnt_1m,
-    SUM  (CASE WHEN x.ts >= b.lo_1m THEN x.amount END) AS sum_1m,
-    MIN  (CASE WHEN x.ts >= b.lo_1m THEN x.amount END) AS min_1m,
-    MAX  (CASE WHEN x.ts >= b.lo_1m THEN x.amount END) AS max_1m,
+    COUNT(CASE WHEN x.ts > b.lo_1m THEN 1 END)        AS cnt_1m,
+    SUM  (CASE WHEN x.ts > b.lo_1m THEN x.amount END) AS sum_1m,
+    MIN  (CASE WHEN x.ts > b.lo_1m THEN x.amount END) AS min_1m,
+    MAX  (CASE WHEN x.ts > b.lo_1m THEN x.amount END) AS max_1m,
     -- … repetido para as 14 janelas seguintes, de 5m a 72h
+    COUNT(CASE WHEN x.ts >= b.lo_hoje THEN 1 END)        AS cnt_hoje,
+    SUM  (CASE WHEN x.ts >= b.lo_hoje THEN x.amount END) AS sum_hoje,
+    MIN  (CASE WHEN x.ts >= b.lo_hoje THEN x.amount END) AS min_hoje,
+    MAX  (CASE WHEN x.ts >= b.lo_hoje THEN x.amount END) AS max_hoje
   FROM tx x CROSS JOIN b
-  WHERE x.account_id = ? AND x.ts >= ? AND x.ts < ?        -- lo_72h e fim do minuto corrente
+  WHERE x.account_id = ? AND x.ts > ? AND x.ts <= ?        -- lo_72h e now
 ) t
 CROSS JOIN (
   SELECT
@@ -262,11 +282,13 @@ CROSS JOIN (
     MAX(CASE WHEN a.dia >= b.lo_7d THEN a.max_amount END) AS max_7d,
     -- … repetido para 31d, 62d e 92d
   FROM daily_agg a CROSS JOIN b
-  WHERE a.account_id = ? AND a.dia >= ? AND a.dia < ?      -- lo_92d e hoje
+  WHERE a.account_id = ? AND a.dia >= ? AND a.dia < ?      -- lo_92d e today
 ) d
 ```
 
-São 19 + 6 binds, gerados no mesmo laço que gera o texto. O resultado é uma linha com 76 colunas. O mapeamento para `WindowAgg`: `COUNT` → `cnt`; `SUM` nulo vira 0; `SUM`, `MIN` e `MAX` são convertidos para centavos com `movePointRight(2).longValueExact()`; `SUM(cnt)` nulo nas janelas de dia vira 0.
+São 20 + 6 binds, gerados no mesmo laço que gera o texto. O resultado é uma linha com 80 colunas: 4 por janela deslizante, 4 do dia corrente e 4 dos dias fechados de cada janela de dias. O mapeamento para `WindowAgg`: `COUNT` → `cnt`; `SUM` nulo vira 0; `SUM`, `MIN` e `MAX` são convertidos para centavos com `movePointRight(2).longValueExact()`; `SUM(cnt)` nulo nas janelas de dia vira 0.
+
+Cada janela de dias é `fechados_j.plus(hoje)`, combinada em Java com o mesmo `WindowAgg.plus` do domínio. Fazer essa soma em SQL exigiria tratar à mão os nulos de `MIN` e `MAX` (`LEAST` e `GREATEST` devolvem nulo se um dos lados for nulo), sem ganho de latência. O filtro `lo_hoje` não precisa de poda própria: o dia corrente começa sempre depois de `lo_72h` (seção 4.2).
 
 Plano esperado, conferido automaticamente pelo Backfill depois da coleta de estatísticas (uma leitura real e `DBMS_XPLAN.DISPLAY_CURSOR`): `PARTITION RANGE ITERATOR` sobre `INDEX RANGE SCAN TX_ACC_TS_AMT_IX`, sem acesso à tabela, mais `INDEX RANGE SCAN DAILY_AGG_PK`. Se o plano for outro, o Backfill imprime o plano e sai com código 4 (rodada inválida).
 
@@ -302,51 +324,37 @@ Uma linha por chamada, com autocommit. `SQLIntegrityConstraintViolationException
 
 ## 6. Adapter Valkey
 
-### 6.1 Chave e valores
+### 6.1 Chaves e valores
 
-Conforme a funcional: chave `fs:{<account_id>}` sem TTL; campos `m:<epoch_minuto>`, `h:<epoch_hora>`, `d:<epoch_dia>`. Valor `cnt|sum|min|max` em centavos inteiros (desvio 1 da seção 1.3). `epoch_dia` é `LocalDate.toEpochDay()` do dia civil em `FS_ZONE`.
+Conforme a funcional, duas chaves por conta, sem TTL:
+
+| Chave | Tipo | Conteúdo |
+| --- | --- | --- |
+| `fs:{<account_id>}:tx` | sorted set | Uma transação por membro. Score: `ts` em microssegundos desde o epoch UTC, como inteiro. Membro: `<tx_id>\|<centavos>` |
+| `fs:{<account_id>}` | hash | Campos `d:<epoch_dia>` com valor `cnt\|sum\|min\|max` em centavos inteiros (desvio 1 da seção 1.3). `epoch_dia` é `LocalDate.toEpochDay()` do dia civil em `FS_ZONE` |
+
+O score é um `double` no Valkey, exato para inteiros até 2^53 µs, ou seja, até o ano 2255. O `tx_id` no membro torna cada transação única: duas transações com mesmo valor no mesmo microssegundo continuam sendo dois membros. As duas chaves têm o mesmo hash tag `{<account_id>}`, então ficariam no mesmo slot num cluster.
 
 ### 6.2 Ingestão: `ingest.lua`
 
-Chamado com `EVALSHA`. `KEYS[1] = fs:{conta}`. ARGV: minuto da transação `M`, hora `H`, valor em centavos, menor minuto retido `M − 59`, menor hora retida `H − 71`. Todos os índices vêm de `tx.ts`, nunca do relógio do servidor.
+Chamado com `EVALSHA`. `KEYS[1] = fs:{conta}:tx`. ARGV: `ts` em microssegundos, membro `<tx_id>|<centavos>` e maior score descartável, `ts − 73h` em microssegundos. Todos os valores vêm de `tx`, nunca do relógio do servidor.
 
 ```lua
-local key, amt = KEYS[1], tonumber(ARGV[3])
-
-local function merge(field)
-  local cur = redis.call('HGET', key, field)
-  if not cur then
-    redis.call('HSET', key, field, '1|' .. ARGV[3] .. '|' .. ARGV[3] .. '|' .. ARGV[3])
-    return true
-  end
-  local c, s, mn, mx = string.match(cur, '^(%d+)|(%d+)|(%d+)|(%d+)$')
-  redis.call('HSET', key, field, string.format('%d|%d|%d|%d',
-    tonumber(c) + 1, tonumber(s) + amt, math.min(tonumber(mn), amt), math.max(tonumber(mx), amt)))
-  return false
-end
-
-local newMinute = merge('m:' .. ARGV[1])
-merge('h:' .. ARGV[2])
-
-if newMinute then
-  local minM, minH = tonumber(ARGV[4]), tonumber(ARGV[5])
-  for _, f in ipairs(redis.call('HKEYS', key)) do
-    local kind, idx = string.sub(f, 1, 1), tonumber(string.sub(f, 3))
-    if (kind == 'm' and idx < minM) or (kind == 'h' and idx < minH) then
-      redis.call('HDEL', key, f)
-    end
-  end
-end
+-- Grava uma transação no sorted set da conta e descarta as que saíram da retenção.
+-- KEYS[1] = fs:{conta}:tx
+-- ARGV[1] = ts em µs, ARGV[2] = '<tx_id>|<centavos>', ARGV[3] = ts − 73h em µs
+redis.call('ZADD', KEYS[1], 'NX', ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
 return 0
 ```
 
-A limpeza com `HKEYS` roda só quando a fatia de minuto é nova, ou seja, no máximo uma vez por minuto por conta. Nas outras transações do mesmo minuto o script faz dois `HGET` e dois `HSET`. A retenção é só uma questão de memória: a leitura filtra por limite de qualquer jeito, então um campo antigo que sobreviva não altera o vetor.
+`NX` mantém o primeiro `ts` de um `tx_id` repetido, como a PK do Oracle mantém a primeira linha: é a idempotência da seção 5 da funcional. Os números passam como strings e o Lua não faz conta com eles, então não há aritmética em `double` no script.
 
-Limite numérico: o Lua do Valkey representa números como `double`, exato até 2^53 centavos (cerca de 90 trilhões de reais por fatia). `%d` formata inteiros sem notação exponencial.
+A retenção é de 73 horas: as 72 da maior janela e 1 de folga. Uma leitura em `now` precisa só de scores maiores que `now − 72h`, então a remoção nunca tira dela uma transação enquanto `now ≥ ts − 1h`. A folga cobre leituras concorrentes com `now` um pouco anterior ao `ts` que o Ingestor acabou de gravar e a transação 1 µs no futuro do cenário C. Quando não há nada a remover, `ZREMRANGEBYSCORE` custa uma busca `O(log n)`. A retenção é só uma questão de memória: a leitura filtra por limite de qualquer jeito.
 
 ### 6.3 Fatia de dia: `put_day.lua`
 
-`KEYS[1] = fs:{conta}`. ARGV: `epoch_dia`, valor `cnt|sum|min|max`, menor dia retido (`T − 92`).
+`KEYS[1] = fs:{conta}`. ARGV: `epoch_dia`, valor `cnt|sum|min|max`, menor dia retido (`T − 91`, o `closedLo` da janela de 92 dias).
 
 ```lua
 redis.call('HSET', KEYS[1], 'd:' .. ARGV[1], ARGV[2])
@@ -363,13 +371,22 @@ Sobrescreve em vez de combinar: o valor vem de `DAILY_AGG`, que já é o total d
 
 ### 6.4 Leitura
 
-`HGETALL fs:{conta}`. Cada campo vira um `Slice` (parse manual de `m:`/`h:`/`d:` e dos quatro inteiros separados por `|`, sem regex). O `SliceAggregator` do domínio combina as fatias com os `Bounds` de `now`. Chave inexistente produz o vetor vazio.
+Dois comandos, enviados um atrás do outro pela API assíncrona na conexão compartilhada e aguardados juntos, numa só ida ao servidor:
+
+| Comando | Devolve |
+| --- | --- |
+| `ZRANGE fs:{conta}:tx (<rollingLo[72h]> <now> BYSCORE WITHSCORES` | As transações de `(now − 72h, now]`. No Lettuce, `zrangebyscoreWithScores` com `Range.from(Boundary.excluding(lo), Boundary.including(now))` |
+| `HGETALL fs:{conta}` | As fatias dos dias fechados |
+
+Cada membro vira uma `Transaction` (score convertido de volta para `Instant`, parse manual de `tx_id|centavos`) e cada campo `d:` vira uma `DaySlice` (parse manual dos quatro inteiros separados por `|`, sem regex). O `WindowAggregator` do domínio combina tudo com os `Limits` de `now`. Chaves inexistentes produzem o vetor vazio.
+
+Não há atomicidade entre as duas chaves, e ela não é necessária: a leitura usa do hash só os dias fechados e do sorted set só as últimas 72 horas e o dia corrente, e cada chave tem um único escritor (o Job diário e o Ingestor).
 
 ### 6.5 Conexão (Lettuce)
 
 | Item | Valor |
 | --- | --- |
-| Conexões no caminho quente | Uma `StatefulRedisConnection<String,String>` compartilhada por todos os workers (o Lettuce multiplexa comandos de vários threads numa conexão), API síncrona |
+| Conexões no caminho quente | Uma `StatefulRedisConnection<String,String>` compartilhada por todos os workers (o Lettuce multiplexa comandos de vários threads numa conexão). API síncrona na ingestão; assíncrona na leitura, para mandar os dois comandos juntos (seção 6.4) |
 | Timeout de comando | 2 s |
 | Scripts | `SCRIPT LOAD` dos dois scripts na inicialização, antes de o relógio começar. `NOSCRIPT` dispara um novo `SCRIPT LOAD` e uma nova tentativa |
 | Carga em massa (Backfill, Job, Equivalência) | Uma segunda conexão, só para isso, com API assíncrona, `setAutoFlushCommands(false)` e `flushCommands()` a cada 1.000 comandos, aguardando os futures do lote |
@@ -379,29 +396,26 @@ Sobrescreve em vez de combinar: o valor vem de `DAILY_AGG`, que já é o total d
 | Operação | Como |
 | --- | --- |
 | `reset()` | `FLUSHDB`. O Valkey da POC é dedicado |
-| `putDays(D, linhas, hoje)` | `put_day.lua` para cada linha de `DAILY_AGG` do dia `D`, em lote assíncrono. Ignora `D < hoje − 92` |
-| `rebuildFromOracle(now)` | Três consultas com uma passada só cada (abaixo), gravadas com `HSET` em lote assíncrono, sem Lua: logo depois do `FLUSHDB` não há nada para combinar |
+| `putDays(D, linhas, hoje)` | `put_day.lua` para cada linha de `DAILY_AGG` do dia `D`, em lote assíncrono. Ignora `D < hoje − 91` |
+| `rebuildFromOracle(now)` | Duas consultas com uma passada só cada (abaixo), gravadas com `ZADD` e `HSET` em lote assíncrono, sem Lua: logo depois do `FLUSHDB` não há nada para descartar nem sobrescrever |
 
-Consultas da reconstrução (com `now` do Backfill):
+Consultas da reconstrução (com `now` do Backfill e os `Limits` dele):
 
 ```sql
-SELECT account_id, TRUNC(ts, 'MI') b, COUNT(*), SUM(amount), MIN(amount), MAX(amount)
-FROM tx WHERE ts >= :lo_1h GROUP BY account_id, TRUNC(ts, 'MI');
-
-SELECT account_id, TRUNC(ts, 'HH') b, COUNT(*), SUM(amount), MIN(amount), MAX(amount)
-FROM tx WHERE ts >= :lo_72h GROUP BY account_id, TRUNC(ts, 'HH');
+SELECT account_id, tx_id, ts, amount
+FROM tx WHERE ts > :lo_72h AND ts <= :now;
 
 SELECT account_id, dia, cnt, sum_amount, min_amount, max_amount
 FROM daily_agg WHERE dia >= :lo_92d AND dia < :hoje;
 ```
 
-`TRUNC` de um `TIMESTAMP` em UTC devolve um `DATE` em UTC. O Java converte esse valor para o índice epoch da unidade.
+Com 100 mil contas e o histórico do Backfill, a primeira consulta devolve cerca de 1,5 milhão de linhas.
 
 ## 7. Fluxo de uma operação
 
 **Ingestão, modo `oracle+valkey`:** o Ingestor tira a próxima transação do dataset e define `ts = clock.instant()`. Em seguida chama `oracle.ingest(tx)` e registra a linha `ingest_oracle`, depois chama `valkey.ingest(tx)` e registra a linha `ingest_valkey`. No modo `oracle`, só o primeiro passo acontece.
 
-**Leitura:** o Leitor sorteia a conta e define `now = clock.instant()`. Chama `reader.read(conta, now)`, que devolve o vetor de 95 valores, e registra a linha `read`. Dentro do adapter: o `WindowCatalog.bounds(now)` gera os limites, que viram binds (Oracle) ou filtro sobre as fatias (Valkey).
+**Leitura:** o Leitor sorteia a conta e define `now = clock.instant()`. Chama `reader.read(conta, now)`, que devolve o vetor de 95 valores, e registra a linha `read`. Dentro do adapter: o `WindowCatalog.limits(now)` gera os limites, que viram binds (Oracle) ou filtro sobre as transações e fatias lidas (Valkey).
 
 ## 8. Gerador de carga
 
@@ -522,18 +536,18 @@ Passos:
    | Classe | Conteúdo | Critério que exercita |
    | --- | --- | --- |
    | 0, normal | De 0 a 300 transações espalhadas nos 93 dias | Equivalência geral |
-   | 1, silenciosa | Como a 0, sem nada nas 60 fatias de minuto da janela de 1h (do minuto corrente até 59 minutos antes) | `cnt = 0` nos minutos e em 1h |
-   | 2, só hoje | Transações só no dia corrente | Dias não incluem o dia corrente |
-   | 3, fronteiras | Uma transação exatamente em cada limite inferior das 19 janelas e outra 1 µs antes; também em 00:00 local e 00:00 UTC | Erros de ±1 fatia e de fuso |
+   | 1, silenciosa | Como a 0, sem nada em `(now − 1h, now]` | `cnt = 0` nos minutos e em 1h |
+   | 2, só hoje | Transações só no dia corrente, entre `todayStart` e `now` | Dias incluem o dia corrente |
+   | 3, fronteiras | Uma transação exatamente em cada `rollingLo` (fica fora) e outra 1 µs depois (entra); uma em `now` (entra) e outra 1 µs depois (futuro, fica fora); uma em `todayStart` e outra 1 µs antes; uma às 00:00 local de cada `closedLo` e outra 1 µs antes; também em 00:00 UTC | Limites exclusivo e inclusivo ao microssegundo, erros de ±1 dia e de fuso |
 
 3. Aplica as transações em ordem de `ts` nos dois adapters, via `ingest` do port, de forma síncrona. São cerca de 150 mil transações, menos de um minuto por adapter.
 4. Para cada dia `D` de `T − 92` a `T − 1`: `closeDay(D)` e `putDays(D, …, T)`.
-5. Lê cada conta em `now` nos dois adapters e calcula um terceiro vetor com `ReferenceModel`. Esse modelo filtra as transações em memória com aritmética de `ZonedDateTime` e não usa `WindowCatalog`: assim os dois adapters não podem estar errados do mesmo jeito.
+5. Lê cada conta em `now` nos dois adapters e calcula um terceiro vetor com `ReferenceModel`. Esse modelo filtra as transações em memória, aplicando a seção 3 da funcional literalmente (`now − N < ts ≤ now`; dias civis por `ZonedDateTime`), e não usa `WindowCatalog.limits`, `WindowAggregator` nem `DAILY_AGG`: assim os dois adapters não podem estar errados do mesmo jeito.
 6. Verificações (cada uma imprime `PASS` ou `FAIL` com até 20 divergências: conta, nome da posição, valores):
    - vetores com 95 posições e nomes na ordem de `FeatureVector.names()`;
    - Oracle = Valkey = referência para todas as contas;
    - classe 1: `cnt = 0` nas 5 janelas de minutos e em 1h;
-   - classe 2: `cnt = 0` nas 4 janelas de dias;
+   - classe 2: `cnt` de cada uma das 4 janelas de dias igual ao número de transações da conta;
    - `checkDay(D)` com 0 linhas para todos os dias fechados;
    - reaplicar todas as transações no adapter Oracle não muda `COUNT(*)` de `TX` nem os vetores Oracle.
 7. Exit code 0 se todas passarem; 1 caso contrário.
@@ -616,10 +630,11 @@ Subir de 100 mil para 300 mil contas muda só `--accounts`.
 
 | Alvo | Casos |
 | --- | --- |
-| `WindowCatalog` | `bounds` nas viradas de minuto, hora e dia; `now` exatamente na fronteira e 1 µs antes; dia civil em `America/Sao_Paulo` contra UTC entre 21:00 e 23:59 locais; ordem e sufixos das 19 janelas |
-| `WindowAgg` / `SliceAggregator` | Combinação com vazio; mínimo e máximo; fatias fora do limite e no futuro; janela de 1h usando fatias de minuto |
+| `WindowCatalog` | `rollingLo = now − span` para as 15 janelas; truncamento de `now` ao microssegundo; `todayStart` e `today` com `now` exatamente em 00:00 local e 1 µs antes; dia civil em `America/Sao_Paulo` contra UTC entre 21:00 e 23:59 locais; `closedLo = today − (n − 1)`; ordem e sufixos das 19 janelas |
+| `WindowAgg` / `WindowAggregator` | Combinação com vazio; mínimo e máximo; transação exatamente em `rollingLo` (fora) e em `now` (dentro); transação no futuro; dia corrente somado às 4 janelas de dias; fatia de dia fora do intervalo e fatia de hoje ignoradas |
+| `Transaction` | `ts` com nanossegundos truncado ao microssegundo |
 | `FeatureVector` | 95 nomes e valores; `avg` com escala 4 `HALF_EVEN`; nulos quando `cnt = 0` |
-| Parser de fatia do Valkey | Campos `m:`/`h:`/`d:` válidos; valor malformado vira exceção |
+| Parser do Valkey | Membro `tx_id\|centavos` e campo `d:` válidos; membro, campo ou valor malformado vira exceção |
 | `AccountSampler` / `AmountSampler` | Mesma sequência para o mesmo seed; proporção de contas quentes perto de 50% |
 | Relatório | Percentil nearest-rank em amostras pequenas conhecidas; descarte do warmup; TPS; agrupamento por `run` |
 | Parser de argumentos | Defaults, tipos inválidos, argumento desconhecido |
@@ -629,7 +644,7 @@ Subir de 100 mil para 300 mil contas muda só `--accounts`.
 Testes com a tag `integration`. Só rodam com `ORACLE_URL` e `VALKEY_URL` definidas. Os destrutivos (que esvaziam `TX`, `DAILY_AGG` ou o Valkey) só rodam se os dois apontarem para `localhost`, ou com `FS_IT_DESTRUCTIVE=1` explícito, para nunca apagarem um ambiente remoto por engano. Contêm:
 
 - `EquivalenceIT`: chama a mesma classe `EquivalenceCheck` do programa `equivalencia`, com 1.000 contas;
-- teste de cada script Lua isolado: fatia nova, combinação e limpeza da retenção;
+- teste de cada script Lua isolado: `ingest.lua` com `tx_id` novo, `tx_id` repetido (não muda o score) e descarte de mais de 72 horas; `put_day.lua` com sobrescrita e limpeza da retenção;
 - teste do SQL de leitura contra uma conta conhecida, inclusive conferindo o plano (seção 5.3).
 
 ### 12.3 Matriz de aceitação
@@ -638,7 +653,8 @@ Testes com a tag `integration`. Só rodam com `ORACLE_URL` e `VALKEY_URL` defini
 | --- | --- |
 | `read` devolve 95 valores na ordem | `equivalencia` (nomes e tamanho) e unitários de `FeatureVector` |
 | Sem transação na última hora → `cnt = 0` nos minutos e em 1h | `equivalencia`, classe 1 |
-| Dias não incluem o dia corrente | `equivalencia`, classe 2, e unitários de `WindowCatalog` |
+| Dias incluem o dia corrente até `now` | `equivalencia`, classe 2, e unitários de `WindowCatalog` e `WindowAggregator` |
+| Limites das janelas deslizantes ao microssegundo | `equivalencia`, classe 3, e unitários de `WindowCatalog` e `WindowAggregator` |
 | Cenário C sem divergência em pelo menos 1.000 contas | `equivalencia --accounts 1000` |
 | Reaplicar o dataset não altera os contadores | `equivalencia`, passo de reaplicação |
 | Job diário = recálculo sobre `TX` | `equivalencia`, `checkDay` para cada dia |
@@ -652,8 +668,9 @@ Testes com a tag `integration`. Só rodam com `ORACLE_URL` e `VALKEY_URL` defini
 | --- | --- | --- |
 | Tudo na mesma máquina | Ingestor, Leitor, Oracle e Valkey disputam CPU; os números absolutos não valem para a OCI | A POC compara modos (premissa da funcional); registrar CPU e memória da máquina no `.meta` (`host`) e no relatório |
 | Contas quentes no modo `skewed` | Contenção em folhas do índice `(account_id, ts, amount)` e leituras que varrem cerca de 1.000 entradas | É a condição realista que se quer medir; observar o p99 de `read` no modo `oracle` |
-| Payload do `HGETALL` | Contas quentes têm até 224 campos (alguns KB) por leitura | Se o p99 de `read` no Valkey ficar muito acima do RTT, testar uma variante Lua que devolva só as 19 agregações. Isso exigiria duplicar a definição de janelas no Lua, coberta pela `equivalencia` |
-| Hashes acima de 128 campos | O Valkey troca a codificação listpack por hashtable e usa mais memória | Aceito: mantém a paridade com o default do OCI Cache |
+| Payload do `ZRANGE` | Contas quentes devolvem cerca de 1.000 membros (dezenas de KB) por leitura, o mesmo volume que o Oracle varre no índice | Se o p99 de `read` no Valkey ficar muito acima do RTT, testar uma variante Lua que agregue no servidor e devolva só os 19 agregados. Isso exigiria duplicar a definição de janelas no Lua, coberta pela `equivalencia` |
+| Sorted sets acima de 128 membros | O Valkey troca a codificação listpack por skiplist nas contas quentes e usa mais memória | Aceito: mantém a paridade com o default do OCI Cache |
+| Dia recém-fechado antes do Job | Entre 00:00 e o fim do Job diário, o dia que acabou de fechar ainda não está em `DAILY_AGG` nem no hash, e as janelas de dias ficam sem ele | Na POC o Job roda fora da medição. Em produção, rodar o Job logo após 00:00 ou, se a lacuna não for aceitável, calcular D−1 a partir das transações, que estão dentro das 72 horas |
 | `UPDATE GLOBAL INDEXES` no `DROP PARTITION` | Custo assíncrono de limpeza do índice global | Fora da janela de medição; o Job roda à parte |
 | Relógio do pod e `now` lógico | A `equivalencia` usa `--now`, e as janelas no futuro em relação ao relógio são válidas | Os adapters não leem relógio (seção 4.1), então o resultado não depende do relógio do pod |
-| Fuso com offset fracionário | A fatia de hora UTC deixaria de coincidir com a hora local | Fora de escopo; `America/Sao_Paulo` tem offset de hora cheia |
+| Fuso com horário de verão | O dia civil passaria a ter 23 ou 25 horas; as janelas deslizantes não mudam, porque `span` é uma `Duration` | `todayStart` vem de `atStartOfDay(zone)`, que já trata o caso; `America/Sao_Paulo` não tem horário de verão desde 2019 |
