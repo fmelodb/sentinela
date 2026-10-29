@@ -29,6 +29,7 @@ public final class Main {
                 case "ingestor" -> IngestorApp.run(rest);
                 case "leitor" -> ReaderApp.run(rest);
                 case "backfill" -> BackfillApp.run(rest);
+                case "job-diario" -> DailyJobApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
