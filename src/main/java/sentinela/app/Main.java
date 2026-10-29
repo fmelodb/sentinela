@@ -23,6 +23,7 @@ public final class Main {
         String[] rest = Arrays.copyOfRange(argv, 1, argv.length);
         try {
             return switch (argv[0]) {
+                case "gerador" -> GeneratorApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
