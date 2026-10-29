@@ -30,6 +30,7 @@ public final class Main {
                 case "leitor" -> ReaderApp.run(rest);
                 case "backfill" -> BackfillApp.run(rest);
                 case "job-diario" -> DailyJobApp.run(rest);
+                case "equivalencia" -> EquivalenceApp.run(rest);
                 default -> usage();
             };
         } catch (UsageException e) {
