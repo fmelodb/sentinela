@@ -97,9 +97,10 @@ public final class BackfillApp {
 
             if (vm != null) {
                 try (ValkeyMaintenance.SliceWriter w = vm.sliceWriter()) {
-                    om.streamSlices(now, w::write);
+                    om.streamRecent(now, w::writeTx);
+                    om.streamDays(now, w::writeDay);
                     w.close();
-                    step(t0, "Valkey reconstruído: " + w.written() + " fatias");
+                    step(t0, "Valkey reconstruído: " + w.written() + " comandos (transações de 72h e dias fechados)");
                 }
             }
             return ExitCodes.OK;

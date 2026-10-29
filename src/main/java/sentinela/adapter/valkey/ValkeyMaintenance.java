@@ -5,8 +5,9 @@ import io.lettuce.core.api.sync.RedisCommands;
 import java.util.List;
 import sentinela.domain.AccountAgg;
 import sentinela.domain.KeyedSlice;
+import sentinela.domain.Transaction;
 
-/** Operações fora do port: reset, fatias de dia do Job e reconstrução a partir do Oracle. */
+/** Operações fora do port: reset, fatias de dia do Job e reconstrução a partir do Oracle (sorted set e hash). */
 public final class ValkeyMaintenance {
     private static final int BATCH = 1_000;
 
@@ -47,7 +48,7 @@ public final class ValkeyMaintenance {
         return new SliceWriter(new AsyncBatch(bulk, BATCH));
     }
 
-    /** Grava fatias com HSET, sem combinar: usado logo depois de um reset. */
+    /** Grava transações (ZADD) e fatias de dia (HSET) sem Lua: usado logo depois de um reset. */
     public static final class SliceWriter implements AutoCloseable {
         private final AsyncBatch batch;
 
@@ -55,9 +56,14 @@ public final class ValkeyMaintenance {
             this.batch = batch;
         }
 
-        public void write(KeyedSlice s) {
-            batch.add(batch.commands().hset(SliceCodec.key(s.accountId()),
-                    SliceCodec.field(s.slice().unit(), s.slice().index()), SliceCodec.encode(s.slice().agg())));
+        public void writeTx(Transaction tx) {
+            batch.add(batch.commands().zadd(SliceCodec.txKey(tx.accountId()), (double) SliceCodec.micros(tx.ts()),
+                    SliceCodec.member(tx)));
+        }
+
+        public void writeDay(KeyedSlice s) {
+            batch.add(batch.commands().hset(SliceCodec.key(s.accountId()), SliceCodec.dayField(s.slice().epochDay()),
+                    SliceCodec.encode(s.slice().agg())));
         }
 
         public long written() {

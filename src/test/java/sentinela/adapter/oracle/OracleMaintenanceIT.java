@@ -17,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import sentinela.domain.AccountAgg;
+import sentinela.domain.DaySlice;
 import sentinela.domain.KeyedSlice;
 import sentinela.domain.Transaction;
 import sentinela.domain.Unit;
@@ -102,25 +103,25 @@ class OracleMaintenanceIT {
     }
 
     @Test
-    void bulkInsertsAndStreamsSlices() {
-        Instant now = now();
-        long m0 = WindowCatalog.epochMinute(now);
+    void bulkInsertsAndStreamsWhatTheValkeyNeeds() {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
         long today = WindowCatalog.epochDay(now, env.zone());
         List<Transaction> txs = new ArrayList<>();
         LongStream.rangeClosed(1, 12_000).forEach(i -> txs.add(new Transaction(i, 1 + i % 3, now.minusSeconds(i % 50), 100)));
-        assertEquals(12_000, m.bulkInsertTx(txs.iterator()));
-        assertEquals(12_000, m.countTx());
+        txs.add(new Transaction(20_000, 1, now.minus(80, ChronoUnit.HOURS), 100));
+        txs.add(new Transaction(20_001, 1, now.plusSeconds(5), 100));
+        assertEquals(12_002, m.bulkInsertTx(txs.iterator()));
         m.bulkInsertDaily(today - 5, List.of(new AccountAgg(1, new WindowAgg(4, 1000, 100L, 400L))));
+        m.bulkInsertDaily(today - 95, List.of(new AccountAgg(1, WindowAgg.of(1))));
 
-        List<KeyedSlice> slices = new ArrayList<>();
-        m.streamSlices(now, slices::add);
-        long minuteCnt = slices.stream().filter(s -> s.slice().unit() == Unit.MINUTE).mapToLong(s -> s.slice().agg().cnt()).sum();
-        long hourCnt = slices.stream().filter(s -> s.slice().unit() == Unit.HOUR).mapToLong(s -> s.slice().agg().cnt()).sum();
-        assertEquals(12_000, minuteCnt);
-        assertEquals(12_000, hourCnt);
-        assertTrue(slices.stream().allMatch(s -> s.slice().unit() != Unit.MINUTE || s.slice().index() <= m0));
-        assertTrue(slices.contains(new KeyedSlice(1, new sentinela.domain.Slice(Unit.DAY, today - 5,
-                new WindowAgg(4, 1000, 100L, 400L)))));
+        List<Transaction> recent = new ArrayList<>();
+        m.streamRecent(now, recent::add);
+        assertEquals(12_000, recent.size(), "só (now − 72h, now]");
+        assertTrue(recent.containsAll(txs.subList(0, 12_000)), "tx_id, conta, ts e valor intactos");
+
+        List<KeyedSlice> days = new ArrayList<>();
+        m.streamDays(now, days::add);
+        assertEquals(List.of(new KeyedSlice(1, new DaySlice(today - 5, new WindowAgg(4, 1000, 100L, 400L)))), days);
     }
 
     @Test

@@ -22,11 +22,10 @@ public final class LuaScripts {
         putDaySha = sync.scriptLoad(putDaySource);
     }
 
-    public void ingest(RedisCommands<String, String> sync, String key, long minute, long hour, long cents,
-            long minMinute, long minHour) {
-        String[] keys = {key};
-        String[] args = {Long.toString(minute), Long.toString(hour), Long.toString(cents),
-                Long.toString(minMinute), Long.toString(minHour)};
+    public void ingest(RedisCommands<String, String> sync, String txKey, long tsMicros, String member,
+            long dropUpToMicros) {
+        String[] keys = {txKey};
+        String[] args = {Long.toString(tsMicros), member, Long.toString(dropUpToMicros)};
         try {
             sync.evalsha(ingestSha, ScriptOutputType.INTEGER, keys, args);
         } catch (RedisNoScriptException e) {

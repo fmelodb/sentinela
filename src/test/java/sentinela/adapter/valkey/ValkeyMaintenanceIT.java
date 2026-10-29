@@ -7,7 +7,6 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -15,10 +14,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import sentinela.domain.AccountAgg;
+import sentinela.domain.DaySlice;
 import sentinela.domain.FeatureVector;
 import sentinela.domain.KeyedSlice;
-import sentinela.domain.Slice;
-import sentinela.domain.Unit;
+import sentinela.domain.Transaction;
 import sentinela.domain.WindowAgg;
 import sentinela.domain.WindowCatalog;
 import sentinela.infra.Env;
@@ -61,7 +60,7 @@ class ValkeyMaintenanceIT {
 
     @Test
     void resetEmpties() {
-        raw.hset("fs:{1}", "m:1", "1|1|1|1");
+        raw.hset("fs:{1}", "d:1", "1|1|1|1");
         assertFalse(vm.isEmpty());
         vm.reset();
         assertTrue(vm.isEmpty());
@@ -80,7 +79,8 @@ class ValkeyMaintenanceIT {
 
         vm.putDays(today - 1, List.of(new AccountAgg(1, WindowAgg.of(9))), today);
         assertEquals("1|9|9|9", raw.hget("fs:{1}", "d:" + (today - 1)), "sobrescreve: idempotente");
-        assertEquals(0, vm.putDays(today - 93, rows, today), "dia fora da retenção não é gravado");
+        assertEquals(0, vm.putDays(today - 92, rows, today), "92 dias atrás já está fora da 92d");
+        assertEquals(2, vm.putDays(today - 91, rows, today), "91 dias atrás é o primeiro dia da 92d");
     }
 
     @Test
@@ -91,26 +91,24 @@ class ValkeyMaintenanceIT {
     }
 
     @Test
-    void sliceWriterRebuildsReadableHashes() {
-        Instant now = Instant.now().truncatedTo(ChronoUnit.MINUTES).plusSeconds(30);
-        long m = WindowCatalog.epochMinute(now);
-        long h = WindowCatalog.epochHour(now);
+    void sliceWriterRebuildsReadableStore() {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        Instant ts = now.minusSeconds(10);
         long today = WindowCatalog.epochDay(now, env.zone());
-        List<KeyedSlice> slices = new ArrayList<>();
-        for (long acc = 1; acc <= 2_500; acc++) {
-            slices.add(new KeyedSlice(acc, new Slice(Unit.MINUTE, m, WindowAgg.of(100))));
-            slices.add(new KeyedSlice(acc, new Slice(Unit.HOUR, h, WindowAgg.of(100))));
-            slices.add(new KeyedSlice(acc, new Slice(Unit.DAY, today - 1, new WindowAgg(3, 900, 100L, 500L))));
-        }
+        WindowAgg closed = new WindowAgg(3, 900, 100L, 500L);
         try (ValkeyMaintenance.SliceWriter w = vm.sliceWriter()) {
-            slices.forEach(w::write);
+            for (long acc = 1; acc <= 2_500; acc++) {
+                w.writeTx(new Transaction(acc, acc, ts, 100));
+                w.writeDay(new KeyedSlice(acc, new DaySlice(today - 1, closed)));
+            }
             w.close();
-            assertEquals(7_500, w.written());
+            assertEquals(5_000, w.written());
         }
         FeatureVector v = store.read(2_500, now);
         assertEquals(WindowAgg.of(100), v.agg(0));
         assertEquals(WindowAgg.of(100), v.agg(6));
-        assertEquals(new WindowAgg(3, 900, 100L, 500L), v.agg(15));
-        assertEquals(2_500, raw.dbsize());
+        WindowAgg expected7d = WindowCatalog.epochDay(ts, env.zone()) == today ? closed.plus(WindowAgg.of(100)) : closed;
+        assertEquals(expected7d, v.agg(15));
+        assertEquals(5_000, raw.dbsize(), "duas chaves por conta");
     }
 }

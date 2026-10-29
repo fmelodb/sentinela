@@ -17,10 +17,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.sql.DataSource;
 import sentinela.domain.AccountAgg;
+import sentinela.domain.DaySlice;
 import sentinela.domain.KeyedSlice;
-import sentinela.domain.Slice;
+import sentinela.domain.Limits;
 import sentinela.domain.Transaction;
-import sentinela.domain.Unit;
 import sentinela.domain.WindowAgg;
 import sentinela.domain.WindowCatalog;
 import sentinela.infra.StoreException;
@@ -28,7 +28,6 @@ import sentinela.infra.StoreException;
 /** Operações fora do port: Job diário, retenção, reset, carga em massa e reconstrução do Valkey. */
 public final class OracleMaintenance {
     static final int TX_RETENTION_DAYS = 93;
-    static final int DAY_SLICES = 92;
     private static final int BATCH = 5_000;
     private static final int COMMIT_EVERY = 50_000;
     private static final Pattern HIGH_VALUE = Pattern.compile("(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})");
@@ -187,26 +186,39 @@ public final class OracleMaintenance {
         });
     }
 
-    public void streamSlices(Instant now, Consumer<KeyedSlice> sink) {
-        long minute = WindowCatalog.epochMinute(now);
-        long hour = WindowCatalog.epochHour(now);
-        long today = WindowCatalog.epochDay(now, zone);
-        try (Connection c = ds.getConnection()) {
-            streamTxSlices(c, "MI", Unit.MINUTE, OracleTime.sliceStart(Unit.MINUTE, minute - 59), sink);
-            streamTxSlices(c, "HH", Unit.HOUR, OracleTime.sliceStart(Unit.HOUR, hour - 71), sink);
-            try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT account_id, dia, cnt, sum_amount, min_amount, max_amount FROM daily_agg WHERE dia >= ? AND dia < ?")) {
-                ps.setObject(1, OracleTime.day(today - DAY_SLICES));
-                ps.setObject(2, OracleTime.day(today));
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        long day = rs.getObject(2, LocalDate.class).toEpochDay();
-                        sink.accept(new KeyedSlice(rs.getLong(1), new Slice(Unit.DAY, day, agg(rs, 3))));
-                    }
+    /** Transações de (now − 72h, now], para o sorted set do Valkey. */
+    public void streamRecent(Instant now, Consumer<Transaction> sink) {
+        Limits l = WindowCatalog.limits(now, zone);
+        try (Connection c = ds.getConnection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT account_id, tx_id, ts, amount FROM tx WHERE ts > ? AND ts <= ?")) {
+            ps.setObject(1, OracleTime.utc(l.oldestRolling()));
+            ps.setObject(2, OracleTime.utc(l.now()));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    sink.accept(new Transaction(rs.getLong(2), rs.getLong(1),
+                            OracleTime.instant(rs.getObject(3, LocalDateTime.class)), OracleTime.cents(rs.getBigDecimal(4))));
                 }
             }
         } catch (SQLException e) {
-            throw new StoreException("leitura de fatias para o Valkey", e);
+            throw new StoreException("leitura de transações recentes para o Valkey", e);
+        }
+    }
+
+    /** Dias fechados das janelas de dias (do primeiro dia da 92d a ontem), para o hash do Valkey. */
+    public void streamDays(Instant now, Consumer<KeyedSlice> sink) {
+        Limits l = WindowCatalog.limits(now, zone);
+        try (Connection c = ds.getConnection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT account_id, dia, cnt, sum_amount, min_amount, max_amount FROM daily_agg WHERE dia >= ? AND dia < ?")) {
+            ps.setObject(1, OracleTime.day(l.oldestClosed()));
+            ps.setObject(2, OracleTime.day(l.today()));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long day = rs.getObject(2, LocalDate.class).toEpochDay();
+                    sink.accept(new KeyedSlice(rs.getLong(1), new DaySlice(day, agg(rs, 3))));
+                }
+            }
+        } catch (SQLException e) {
+            throw new StoreException("leitura de dias fechados para o Valkey", e);
         }
     }
 
@@ -276,22 +288,6 @@ public final class OracleMaintenance {
             throw new StoreException("carga em massa (" + n + " linhas enviadas)", e);
         }
         return n;
-    }
-
-    private void streamTxSlices(Connection c, String fmt, Unit unit, LocalDateTime from, Consumer<KeyedSlice> sink)
-            throws SQLException {
-        String sql = "SELECT account_id, TRUNC(ts, '" + fmt + "'), COUNT(*), SUM(amount), MIN(amount), MAX(amount)"
-                + " FROM tx WHERE ts >= ? GROUP BY account_id, TRUNC(ts, '" + fmt + "')";
-        try (PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setObject(1, from);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    Instant start = OracleTime.instant(rs.getObject(2, LocalDateTime.class));
-                    long index = unit == Unit.MINUTE ? WindowCatalog.epochMinute(start) : WindowCatalog.epochHour(start);
-                    sink.accept(new KeyedSlice(rs.getLong(1), new Slice(unit, index, agg(rs, 3))));
-                }
-            }
-        }
     }
 
     private static WindowAgg agg(ResultSet rs, int firstColumn) throws SQLException {
