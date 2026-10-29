@@ -11,7 +11,6 @@ import java.util.NoSuchElementException;
 import java.util.SplittableRandom;
 import sentinela.domain.AccountAgg;
 import sentinela.domain.Transaction;
-import sentinela.domain.Unit;
 import sentinela.domain.WindowAgg;
 import sentinela.domain.WindowCatalog;
 import sentinela.workload.AccountSampler.Distribution;
@@ -66,8 +65,8 @@ public final class BackfillGenerator {
                     if (day > today) {
                         return false;
                     }
-                    dayStart = WindowCatalog.sliceStart(Unit.DAY, day, zone);
-                    Instant nextDay = WindowCatalog.sliceStart(Unit.DAY, day + 1, zone);
+                    dayStart = WindowCatalog.dayStart(day, zone);
+                    Instant nextDay = WindowCatalog.dayStart(day + 1, zone);
                     Instant end = nextDay.isBefore(now) ? nextDay : now;
                     spanMicros = Duration.between(dayStart, end).toNanos() / 1_000;
                     long dayMicros = Duration.between(dayStart, nextDay).toNanos() / 1_000;

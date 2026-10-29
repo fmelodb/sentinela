@@ -12,7 +12,6 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import sentinela.domain.AccountAgg;
 import sentinela.domain.Transaction;
-import sentinela.domain.Unit;
 import sentinela.domain.WindowCatalog;
 import sentinela.workload.AccountSampler.Distribution;
 
@@ -27,7 +26,7 @@ class BackfillGeneratorTest {
     @Test
     void recentTransactionsCoverThreeClosedDaysAndTodayUntilNow() {
         BackfillGenerator g = gen();
-        Instant from = WindowCatalog.sliceStart(Unit.DAY, g.today() - BackfillGenerator.RECENT_DAYS, SP);
+        Instant from = WindowCatalog.dayStart(g.today() - BackfillGenerator.RECENT_DAYS, SP);
         List<Transaction> txs = new ArrayList<>();
         g.recentTransactions().forEachRemaining(txs::add);
         // 3 dias × 5.000 + 12h07m30s de hoje (≈ 50,5% de 5.000)

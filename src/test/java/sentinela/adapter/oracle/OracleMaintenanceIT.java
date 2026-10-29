@@ -20,7 +20,6 @@ import sentinela.domain.AccountAgg;
 import sentinela.domain.DaySlice;
 import sentinela.domain.KeyedSlice;
 import sentinela.domain.Transaction;
-import sentinela.domain.Unit;
 import sentinela.domain.WindowAgg;
 import sentinela.domain.WindowCatalog;
 import sentinela.infra.Env;
@@ -72,7 +71,7 @@ class OracleMaintenanceIT {
     void closeDayMatchesRecalculationAndIsIdempotent() {
         Instant now = now();
         long yesterday = WindowCatalog.epochDay(now, env.zone()) - 1;
-        Instant noon = WindowCatalog.sliceStart(Unit.DAY, yesterday, env.zone()).plus(12, ChronoUnit.HOURS);
+        Instant noon = WindowCatalog.dayStart(yesterday, env.zone()).plus(12, ChronoUnit.HOURS);
         store.ingest(new Transaction(1, 10, noon, 100));
         store.ingest(new Transaction(2, 10, noon.plusSeconds(60), 300));
         store.ingest(new Transaction(3, 11, noon, 50));
