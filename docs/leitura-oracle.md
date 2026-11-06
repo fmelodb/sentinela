@@ -1,7 +1,7 @@
 # Como os dados são consultados no Oracle
 
-A leitura do vetor de features de uma conta é feita em **um único statement**, gerado pela classe
-`OracleReadSql` (`src/main/java/sentinela/adapter/oracle/OracleReadSql.java`) a partir do `WindowCatalog`.
+A leitura do vetor de features de uma conta é feita em **um único statement**, gerado pelo módulo
+`read_sql` (`src/sentinela/db/read_sql.py`) a partir do catálogo de janelas (`domain/windows.py`).
 O resultado é **sempre uma única linha larga**, com contagem, soma, mínimo e máximo de cada janela.
 
 O statement combina duas fontes:
@@ -15,7 +15,7 @@ Simplificando para uma janela deslizante (`5m`) e uma janela de dias (`7d`), o S
 
 ```sql
 WITH b AS (                                   -- (A) a linha dos limites
-  SELECT ? AS lo_5m, ? AS lo_hoje, ? AS lo_7d FROM dual
+  SELECT :1 AS lo_5m, :2 AS lo_hoje, :3 AS lo_7d FROM dual
 )
 SELECT t.*, d.*
 FROM (                                        -- (B) agregados sobre TX
@@ -24,14 +24,14 @@ FROM (                                        -- (B) agregados sobre TX
          COUNT(CASE WHEN x.ts >= b.lo_hoje THEN 1 END)        AS cnt_hoje,
          ...
   FROM tx x CROSS JOIN b
-  WHERE x.account_id = ? AND x.ts > ? AND x.ts <= ?
+  WHERE x.account_id = :4 AND x.ts > :5 AND x.ts <= :6
 ) t
 CROSS JOIN (                                  -- (C) agregados sobre DAILY_AGG
   SELECT SUM(CASE WHEN a.dia >= b.lo_7d THEN a.cnt END)        AS cnt_7d,
          SUM(CASE WHEN a.dia >= b.lo_7d THEN a.sum_amount END) AS sum_7d,
          ...
   FROM daily_agg a CROSS JOIN b
-  WHERE a.account_id = ? AND a.dia >= ? AND a.dia < ?
+  WHERE a.account_id = :7 AND a.dia >= :8 AND a.dia < :9
 ) d
 ```
 
@@ -88,8 +88,8 @@ compará-las:
 | 10:01 | 50 | 09:58 | 00:00 |
 | 09:40 | 30 | 09:58 | 00:00 |
 
-Cada limite é passado uma vez, como bind de `b`, e referenciado por nome em quantos `CASE` precisar. Os `?`
-do `WHERE` são binds diretos: eles fazem a **poda**, isto é, restringem a leitura pela conta e pelo
+Cada limite é passado uma vez, como bind de `b`, e referenciado por nome em quantos `CASE` precisar. Os binds
+do `WHERE` (`:4` a `:9` no exemplo) são diretos: eles fazem a **poda**, isto é, restringem a leitura pela conta e pelo
 intervalo total (da janela mais antiga até `now`), o que permite usar o índice por `account_id` e
 timestamp/dia.
 
@@ -116,7 +116,7 @@ fechado. Ela é composta de duas partes:
 - **dia corrente**: as colunas `cnt_hoje`, `sum_hoje`, `min_hoje`, `max_hoje` de `t`, calculadas sobre `TX`
   a partir do início do dia (`x.ts >= lo_hoje`).
 
-A aplicação combina as duas partes depois de ler a linha (`OracleFeatureStore.read`, com
+A aplicação combina as duas partes depois de ler a linha (`read_sql.parse`, com
 `WindowAgg.plus`): soma as contagens e as somas e toma o menor mínimo e o maior máximo.
 
 ## 5. Resumo

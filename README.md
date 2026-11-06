@@ -1,323 +1,225 @@
 # sentinela — POC Feature Store de Fraude
 
-Benchmark reproduzível de uma feature store de contadores em janelas de tempo para detecção de fraude. Ele mede se o **Oracle 26ai** sozinho atende 600 leituras por segundo com latência adequada, ou se o **Valkey 7.2** (OCI Cache) precisa entrar como camada de leitura.
-
-Os dois modos de serving usam o mesmo código, o mesmo dataset e a mesma carga:
-
-| Modo | Ingestão | Leitura |
-| --- | --- | --- |
-| `oracle` | Oracle | Oracle |
-| `oracle+valkey` | Oracle e Valkey | Valkey |
+Benchmark reproduzível de uma feature store de contadores em janelas de tempo, para detecção de fraude. Ele mede se o **Oracle 26ai**, atrás de uma **ingest API** e de uma **query API** em FastAPI, serve 600 leituras por segundo com latência adequada, sob 600 ingestões por segundo concorrentes.
 
 Cada leitura devolve, para uma conta, um vetor de 95 features: 19 janelas (de 1 minuto a 92 dias) × 5 métricas (`cnt`, `sum`, `min`, `max`, `avg`).
 
-Documentação de referência:
+```
+sentinela-sim ──HTTP──► sentinela-api (FastAPI) ──SQL──► Oracle 26ai
+ gerador, ingestor,      POST /v1/transacoes              TX, DAILY_AGG
+ leitor, relatorio       GET  /v1/contas/{id}/features
+```
+
+> Esta é a v2, em Python e só com Oracle. A v1, em Java, com os modos `oracle` e `oracle+valkey` e scripts PowerShell, está na tag **`java-v1`** (`git switch --detach java-v1`).
+
+Documentação:
 
 - [Especificação funcional](docs/specs/Especificação%20funcional%20—%20POC%20Feature%20Store%20de%20Fraude.md): o quê e por quê.
-- [Especificação técnica](docs/specs/Especificação%20técnica%20—%20POC%20Feature%20Store%20de%20Fraude.md): como, incluindo SQL, scripts Lua e decisões.
-- [Plano de implementação](docs/superpowers/plans/2026-10-29-poc-feature-store.md).
+- [Especificação técnica](docs/specs/Especificação%20técnica%20—%20POC%20Feature%20Store%20de%20Fraude.md): como.
+- [Como a leitura consulta o Oracle](docs/leitura-oracle.md).
+- [Rodando na OCI](docs/oci.md): VM + Autonomous Database.
 
 ## 1. Requisitos
 
-### Máquina e ferramentas
+| Item | Observação |
+| --- | --- |
+| Podman 5.x + `podman-compose` (ou Docker + `docker compose`) | No Windows, `podman machine` (WSL) com **pelo menos 8 CPUs e 16 GB**: 6 GB para o Oracle, mais a API e o simulador |
+| bash | Linux, macOS ou o **Git Bash** no Windows. Os scripts não usam PowerShell |
+| ~25 GB de disco | Imagem do Oracle Enterprise (~8 GB) e datafiles |
+| Conta Oracle | Para baixar a imagem do Oracle Database Enterprise (seção 2.1) |
 
-| Item | Versão | Observação |
-| --- | --- | --- |
-| Podman | 5.x | No Windows, com `podman machine` (WSL). A VM precisa de **pelo menos 8 CPUs e 16 GB de RAM**: 6 GB para o Oracle, mais o Valkey e os dois programas Java com 1 GB de heap cada. |
-| PowerShell | 7.x (`pwsh`) | Os scripts em `scripts/` são PowerShell 7; também rodam em Linux. |
-| Git | qualquer | — |
-| Disco | ~25 GB livres | Imagem do Oracle Enterprise (~8 GB), datafiles e imagens de build. |
-| Conta Oracle | — | Necessária para baixar a imagem do Oracle Database Enterprise (seção 2.1). |
-
-**Não é preciso instalar Java nem Maven no host.** O build e os testes rodam no container `maven:3.9-eclipse-temurin-25` pelo script `scripts/mvn.ps1`. Para compilar fora do container, use JDK 25 e Maven 3.9.
-
-### Imagens de container
+**Não é preciso Python no host:** a API, o simulador e os testes rodam em containers. Para desenvolver fora deles, use Python 3.13 e `pip install -e ".[test]"`.
 
 | Imagem | Papel |
 | --- | --- |
-| `container-registry.oracle.com/database/enterprise:latest` | Oracle AI Database 26ai Enterprise Edition (label `release` 23.26.x). O script de ambiente recusa outra linha de versão. |
-| `docker.io/valkey/valkey:7.2` | Online store do modo `oracle+valkey`, sem persistência. |
-| `docker.io/library/maven:3.9-eclipse-temurin-25` | Build e testes. |
-| `docker.io/library/eclipse-temurin:25-jre` | Base da imagem da POC (`localhost/sentinela-poc`). |
+| `container-registry.oracle.com/database/enterprise:latest` | Oracle AI Database 26ai (release 23.26.x), só no desktop |
+| `localhost/sentinela` (construída do `Containerfile`, base `python:3.13-slim`) | Containers `sentinela-api` e `sentinela-sim` |
 
-### Dependências Java (fixadas no `pom.xml`)
-
-| Dependência | Versão | Uso |
-| --- | --- | --- |
-| `com.oracle.database.jdbc:ojdbc17` | 23.26.0.0.0 | Driver JDBC do Oracle |
-| `com.oracle.database.jdbc:ucp17` | 23.26.0.0.0 | Pool de conexões (UCP) |
-| `io.lettuce:lettuce-core` | 6.6.0.RELEASE | Cliente do Valkey |
-| `com.fasterxml.jackson.core:jackson-core` | 2.19.2 | Leitura do dataset NDJSON (só o streaming) |
-| `org.junit.jupiter:junit-jupiter` | 5.13.4 | Testes |
-
-Java 25, sem framework de aplicação, sem injeção de dependência, sem framework de log.
-
-## 2. Deploy no podman
-
-Tudo roda num único pod, `sentinela`, que publica as portas 1521 (Oracle) e 6379 (Valkey) no host:
-
-| Container | Duração | Função |
-| --- | --- | --- |
-| `sentinela-oracle` | permanente | Banco; os dados ficam no volume `sentinela-oradata` |
-| `sentinela-valkey` | permanente | Cache, sem persistência |
-| containers da imagem `localhost/sentinela-poc` | efêmeros | Um por execução de programa |
+## 2. Subir no desktop
 
 ### 2.1 Acesso à imagem do Oracle (uma vez)
 
-1. Entre em <https://container-registry.oracle.com> com sua conta Oracle.
-2. Abra **Database → enterprise** e aceite os termos de licença.
-3. Faça login no registro pelo podman, com o usuário e a senha (ou o *auth token*) da conta:
+Entre em <https://container-registry.oracle.com>, abra **Database → enterprise**, aceite a licença e faça login no registro:
 
-```powershell
+```bash
 podman login container-registry.oracle.com
 ```
 
-Se a imagem já estiver na máquina (`podman image exists container-registry.oracle.com/database/enterprise:latest`), este passo não é necessário.
-
 ### 2.2 Configuração (uma vez)
 
-Copie o modelo e preencha as duas senhas:
-
-```powershell
-Copy-Item .env.example .env.local
-notepad .env.local
+```bash
+cp .env.example .env.local    # e preencha ORACLE_PWD e ORACLE_PASSWORD
 ```
 
 | Variável | Significado |
 | --- | --- |
-| `ORACLE_PWD` | Senha de SYS, SYSTEM e PDBADMIN, definida na criação do banco |
-| `ORACLE_URL` | `jdbc:oracle:thin:@//localhost:1521/SENTINELA` (dentro do pod, tudo é `localhost`) |
+| `ORACLE_PWD` | Senha de SYS, SYSTEM e PDBADMIN do Oracle local, definida na criação do banco |
+| `ORACLE_DSN` | `oracle:1521/SENTINELA` (o serviço `oracle` do compose). Na OCI, a connect string do ATP |
 | `ORACLE_USER` / `ORACLE_PASSWORD` | Usuário da POC (`SENTINELA`) e a senha dele |
-| `VALKEY_URL` | `redis://localhost:6379` |
-| `FS_ZONE` | Fuso do dia civil, que define o corte de D-1 e das janelas de dias. Default `America/Sao_Paulo` |
+| `FS_ZONE` | Fuso do dia civil. Default `America/Sao_Paulo` |
+| `API_WORKERS` / `DB_POOL_SIZE` | Processos do uvicorn e conexões por processo (4 × 8) |
+| `API_CPUS` / `SIM_CPUS` | Limite de CPU dos containers da API e do simulador |
+| `API_URL` | `http://api:8000`: onde o simulador encontra a API |
 
-Use senhas com letras e números, sem aspas, `$` ou espaços, com pelo menos 8 caracteres. O `.env.local` fica fora do git.
+Use senhas só com letras e números, com pelo menos 8 caracteres. O `.env.local` fica fora do git.
 
-### 2.3 Subir o ambiente
+### 2.3 Subir
 
-```powershell
-pwsh scripts/ambiente.ps1 -Acao up
+```bash
+scripts/ambiente.sh up
 ```
 
-O script é idempotente e pode ser rodado de novo sem problema. Ele:
+O script é idempotente. Ele:
+1. sobe o Oracle (volume `sentinela-oradata`) e espera o banco ficar pronto. **Na primeira vez, a criação do banco leva de 10 a 20 minutos**;
+2. cria o usuário `SENTINELA` (`db/00_usuario.sql`);
+3. constrói a imagem e sobe `sentinela-api` e `sentinela-sim`;
+4. cria as tabelas (`db/01_schema.sql`).
 
-1. Confere a imagem do Oracle e cria (ou reinicia) o pod, o volume e os containers `sentinela-oracle` e `sentinela-valkey`.
-2. Espera o banco ficar pronto. **Na primeira vez, a criação do banco leva de 10 a 20 minutos.** Nas seguintes, os datafiles já estão no volume.
-3. Cria o usuário `SENTINELA` na PDB `SENTINELA` (`db/00_usuario.sql`).
-4. Constrói a imagem `localhost/sentinela-poc` a partir do `Containerfile`.
-5. Cria as tabelas `TX` e `DAILY_AGG` (programa `schema`, que executa `db/01_schema.sql`).
+Termina com `ambiente pronto`. Para conferir:
 
-Termina com a mensagem `ambiente pronto`. Para conferir:
-
-```powershell
-podman ps --pod
-podman exec sentinela-valkey valkey-cli ping   # PONG
+```bash
+curl -s localhost:8000/health
+curl -s -X POST localhost:8000/v1/transacoes -H 'Content-Type: application/json' \
+     -d '{"tx_id": 1, "account_id": 42, "ts": "2026-11-06T12:00:00Z", "amount": 150.25}'
+curl -si localhost:8000/v1/contas/42/features | head -20
 ```
 
-### 2.4 Depois de mudar o código
-
-A imagem da POC contém o jar. Depois de alterar `src/`, reconstrua:
-
-```powershell
-podman build -t sentinela-poc .
-```
-
-### 2.5 Parar e remover
+A documentação interativa das APIs fica em <http://localhost:8000/docs>.
 
 | Comando | Efeito |
 | --- | --- |
-| `pwsh scripts/ambiente.ps1 -Acao down` | Remove o pod e os containers; **o volume do Oracle fica**, e o próximo `up` não recria o banco |
-| `pwsh scripts/ambiente.ps1 -Acao destroy` | Remove o pod **e** o volume do Oracle; o próximo `up` cria o banco do zero |
+| `scripts/ambiente.sh build` | Reconstrói a imagem e recria a API e o simulador, depois de mudar o código |
+| `scripts/ambiente.sh down` | Remove os containers; **o volume do Oracle fica** |
+| `scripts/ambiente.sh destroy` | Remove os containers **e** o volume do Oracle |
 
-## 3. Testes automatizados
+## 3. Testes
 
-### Unitários
-
-Não dependem de nenhum store.
-
-```powershell
-pwsh scripts/mvn.ps1 test
+```bash
+scripts/test.sh tests/unit     # unitários, não dependem do banco
+scripts/test.sh                # todos, inclusive integração contra o Oracle local
 ```
 
-### Integração
+> **Atenção:** os testes de integração são **destrutivos**, porque esvaziam `TX` e `DAILY_AGG`. Por proteção, só rodam se `ORACLE_DSN` apontar para o banco local; contra outro banco, só com `FS_IT_DESTRUCTIVE=1`.
 
-Rodam contra o Oracle e o Valkey do pod, que precisa estar no ar.
+## 4. Rodar o benchmark
 
-```powershell
-pwsh scripts/mvn.ps1 verify -Pintegration
+### 4.1 Rodada automatizada
+
+```bash
+scripts/rodada.sh --run minha-rodada
+cat logs/report/report.md
 ```
 
-> **Atenção:** os testes de integração são **destrutivos**: esvaziam `TX`, `DAILY_AGG` e o Valkey. Rode-os antes de uma rodada de benchmark, nunca durante. Como proteção, os testes destrutivos só executam se `ORACLE_URL` e `VALKEY_URL` apontarem para `localhost`; contra outro ambiente, só com `FS_IT_DESTRUCTIVE=1` definido explicitamente.
+O script:
+1. gera `data/tx.ndjson`, se não existir ou se for pequeno demais;
+2. roda o backfill (destrutivo, cerca de 10 minutos com 100 mil contas), que confere o plano de execução real da leitura;
+3. roda ingestor e leitor em paralelo contra a API;
+4. gera o relatório.
 
-Para rodar um teste específico, coloque entre aspas os argumentos que contêm ponto, porque o PowerShell quebra `-Dit.test=...` no ponto:
+Parâmetros: `--run`, `--tps` (600, para cada fluxo), `--duration` (300), `--warmup` (30), `--accounts` (100000), `--concurrency` (64), `--seed` (42) e `--sem-backfill`. Rodada curta, para testar o ambiente:
 
-```powershell
-pwsh scripts/mvn.ps1 test -Dtest=WindowCatalogTest
-pwsh scripts/mvn.ps1 verify -Pintegration '-Dit.test=OracleFeatureStoreIT'
+```bash
+scripts/rodada.sh --run curta --tps 100 --duration 60 --warmup 10 --accounts 10000
 ```
 
-A suíte completa tem 135 testes e leva alguns minutos; o `EquivalenceIT` sozinho aplica cerca de 90 mil transações.
+### 4.2 Passo a passo
 
-## 4. Execução manual
+Os programas de banco rodam no container da API. Os de carga rodam no simulador, que monta `./data` e `./logs` como `/data` e `/logs`.
 
-Todo programa roda num container efêmero dentro do pod, pelo `scripts/poc.ps1`:
-
-```powershell
-pwsh scripts/poc.ps1 <programa> [--argumento valor ...]
+```bash
+podman exec sentinela-sim sentinela gerador --accounts 100000 --count 200000
+podman exec sentinela-api sentinela backfill --accounts 100000
+podman exec sentinela-sim sentinela carga --run r1 --tps-ingest 600 --tps-read 600 --duration 300
+podman exec sentinela-sim sentinela relatorio /logs
 ```
 
-As pastas `./data` e `./logs` do repositório são montadas como `/data` e `/logs` no container. Os caminhos padrão `./data/tx.ndjson` e `./logs/...` já apontam para elas.
+`ingestor` e `leitor` também rodam separadamente, em dois terminais com o mesmo `--run`.
 
-### 4.1 Uma rodada passo a passo
+### 4.3 Equivalência (cenário C)
 
-O exemplo usa o modo `oracle+valkey`; troque por `oracle` para o outro modo.
+Aplica 93 dias de transações de 1.000 contas pela ingest API, lê os vetores pela query API e compara com um modelo de referência calculado em memória. Confere também janelas vazias, dia corrente, limites ao microssegundo, idempotência e o job diário.
 
-**1. Gerar o dataset.** Isso só é preciso uma vez, e o mesmo arquivo serve aos dois modos:
-
-```powershell
-pwsh scripts/poc.ps1 gerador --accounts 100000 --count 200000
+```bash
+podman exec sentinela-api sentinela equivalencia --reset
 ```
 
-**2. Popular o histórico.** O backfill é destrutivo: esvazia os stores antes de popular. Com 100 mil contas leva cerca de 10 minutos. No fim, ele confere o plano de execução real da leitura e sai com código 4 se o índice coberto ou a poda de partições não forem usados:
-
-```powershell
-pwsh scripts/poc.ps1 backfill --mode oracle+valkey --accounts 100000
-```
-
-**3. Rodar ingestor e leitor ao mesmo tempo, em dois terminais, com o mesmo `--run`.** A leitura é medida sob ingestão concorrente:
-
-```powershell
-# terminal 1
-pwsh scripts/poc.ps1 ingestor --mode oracle+valkey --tps 600 --duration 300 --warmup 30 --run minha-rodada
-# terminal 2
-pwsh scripts/poc.ps1 leitor --mode oracle+valkey --tps 600 --duration 300 --warmup 30 --accounts 100000 --run minha-rodada
-```
-
-**4. Gerar o relatório**, que processa todos os logs da pasta:
-
-```powershell
-pwsh scripts/poc.ps1 relatorio /logs
-Get-Content logs/report/report.md
-```
-
-### 4.2 Rodada automatizada
-
-`scripts/rodada.ps1` faz os passos 1 a 4 de uma vez:
-1. gera o dataset se `data/tx.ndjson` não existir;
-2. roda o backfill;
-3. sobe ingestor e leitor em paralelo;
-4. espera os dois e gera o relatório.
-
-```powershell
-pwsh scripts/rodada.ps1 -Mode oracle -Run A-oracle
-pwsh scripts/rodada.ps1 -Mode oracle+valkey -Run B-oracle-valkey
-```
-
-Os parâmetros são `-Mode` (obrigatório), `-Run`, `-Tps` (600), `-Duration` (300), `-Warmup` (30), `-Accounts` (100000), `-Threads` (8) e `-Seed` (42). Depois das duas rodadas, o `report.md` traz a tabela lado a lado dos modos.
-
-Para um teste rápido do ambiente, rode uma rodada curta:
-
-```powershell
-pwsh scripts/rodada.ps1 -Mode oracle+valkey -Run curta -Tps 100 -Duration 60 -Warmup 10 -Accounts 10000
-```
-
-O dataset é reaproveitado entre rodadas. Ao mudar `-Accounts` ou `-Seed`, apague `data/tx.ndjson` antes.
-
-### 4.3 Verificação de equivalência (cenário C)
-
-Aplica a mesma sequência de transações (93 dias, 1.000 contas) nos dois adapters e compara os vetores. Compara também com um modelo de referência calculado em memória, e confere os critérios funcionais: janelas vazias, dia corrente nas janelas de dias, limites ao microssegundo, idempotência e Job diário.
-
-```powershell
-pwsh scripts/poc.ps1 equivalencia --reset
-```
-
-Sem `--reset`, o programa se recusa a rodar se houver dados nos stores. O `--reset` apaga tudo. O resultado esperado são sete linhas `PASS` e exit code 0.
+O `--reset` apaga as tabelas. O resultado esperado são sete linhas `PASS` e código de saída 0.
 
 ### 4.4 Job diário
 
-Fecha um dia em `DAILY_AGG` e, no modo `oracle+valkey`, grava as fatias de dia no Valkey. Também remove partições de `TX` com mais de 93 dias. É idempotente.
+Fecha um dia em `DAILY_AGG` e remove partições de `TX` com mais de 93 dias. É idempotente.
 
-```powershell
-pwsh scripts/poc.ps1 job-diario --mode oracle+valkey               # D-1
-pwsh scripts/poc.ps1 job-diario --mode oracle+valkey --day 2026-10-28
+```bash
+podman exec sentinela-api sentinela job-diario               # D-1
+podman exec sentinela-api sentinela job-diario --day 2026-11-05
 ```
 
 ### 4.5 Referência dos programas
 
-| Programa | Argumentos (default) |
-| --- | --- |
-| `gerador` | `--accounts` (100000), `--count` (200000), `--seed` (42), `--distribution` (`skewed` ou `uniform`), `--dataset` (`./data/tx.ndjson`) |
-| `backfill` | `--mode` (`oracle`), `--accounts` (100000), `--days` (92, de 3 a 92), `--seed` (42), `--distribution` (`skewed`), `--tx-per-day` (5) |
-| `ingestor` | `--mode` (`oracle`), `--tps` (600), `--duration` (300), `--warmup` (30), `--threads` (8), `--dataset`, `--run` (data/hora UTC), `--log` |
-| `leitor` | `--mode` (`oracle`), `--tps` (600), `--duration` (300), `--warmup` (30), `--threads` (8), `--accounts` (100000), `--seed` (42), `--distribution` (`skewed`), `--run`, `--log` |
-| `relatorio` | diretório de logs (argumento único) |
-| `equivalencia` | `--accounts` (1000), `--seed` (42), `--now` (ISO-8601; default agora), `--reset` |
-| `job-diario` | `--mode` (`oracle`), `--day` (`YYYY-MM-DD`; default D-1) |
-| `schema` | — |
+`sentinela <programa> --help` lista os argumentos.
 
-Códigos de saída:
+| Programa | Container | Argumentos (default) |
+| --- | --- | --- |
+| `api` | api | `--workers` ($API_WORKERS), `--port` (8000) |
+| `schema` | api | `--arquivo` |
+| `backfill` | api | `--accounts` (100000), `--days` (92), `--seed` (42), `--distribution` (`skewed`), `--tx-per-day` (5) |
+| `job-diario` | api | `--day` (D-1) |
+| `equivalencia` | api | `--accounts` (1000), `--seed` (42), `--now` (agora), `--reset` |
+| `gerador` | sim | `--accounts` (100000), `--count` (200000), `--seed`, `--distribution`, `--dataset` (`./data/tx.ndjson`) |
+| `ingestor` | sim | `--tps` (600), `--duration` (300), `--warmup` (30), `--concurrency` (64), `--dataset`, `--run`, `--log` |
+| `leitor` | sim | `--tps`, `--duration`, `--warmup`, `--concurrency`, `--accounts`, `--seed`, `--distribution`, `--run`, `--log` |
+| `carga` | sim | `--tps-ingest` (600), `--tps-read` (600) e os demais de ingestor e leitor |
+| `relatorio` | sim | diretório de logs |
 
-| Código | Significado |
-| --- | --- |
-| 0 | Sucesso |
-| 1 | Verificação falhou |
-| 2 | Argumento ou variável de ambiente inválida |
-| 3 | Store indisponível |
-| 4 | Rodada inválida (dataset esgotado ou plano de execução errado) |
-| 5 | Erro inesperado |
+Códigos de saída: 0 sucesso, 1 verificação falhou, 2 argumento ou ambiente inválido, 3 banco ou API indisponível, 4 rodada inválida (dataset esgotado ou plano de execução errado), 5 erro inesperado.
 
 ## 5. Lendo o relatório
 
-O relatório tem uma tabela por execução e uma tabela comparando os dois modos:
+`logs/report/report.md` tem uma tabela por execução. `report.csv` traz as mesmas linhas, para planilha, e `tps-series.csv`, as operações por segundo.
 
-| Arquivo | Conteúdo |
+Cada linha mostra a latência de duas formas:
+
+| Coluna | O que mede |
 | --- | --- |
-| `logs/report/report.md` | As tabelas |
-| `logs/report/report.csv` | As mesmas linhas, para planilha |
-| `logs/report/tps-series.csv` | Operações por segundo, para encontrar quedas |
+| **HTTP** avg/p95/p99/max | O tempo visto pelo simulador: rede, FastAPI e banco |
+| **DB** avg/p95/p99/max | O tempo da chamada ao Oracle medido dentro da API (header `Server-Timing`), incluindo a espera por conexão do pool |
 
-Uma rodada só vale se todas as linhas tiverem **as três** colunas de verificação em `sim`:
+A diferença entre as duas é o custo da camada HTTP. Uma rodada só vale se todas as linhas tiverem **as três** colunas de verificação em `sim`:
 
 | Coluna | Critério |
 | --- | --- |
 | **TPS ok** | Desvio do TPS alcançado em relação ao alvo menor que 5% |
 | **Erro ok** | Taxa de erro menor que 0,1% |
-| **Fila ok** | No máximo 1% das operações após o warmup começou mais de 100 ms depois do instante agendado. A coluna *Atraso máx* mostra o pior caso. |
+| **Fila ok** | No máximo 1% das requisições após o warmup saiu mais de 100 ms depois do instante agendado |
 
-A latência registrada cobre só a chamada ao store. Quando o cliente não dá conta da taxa, as operações esperam numa fila, e essa espera não entra nos percentis. A coluna **Fila ok** existe para detectar isso. O TPS sozinho não detecta: depois de um travamento, a fila é esvaziada dentro da janela medida e o TPS volta ao alvo.
-
-Resultado da rodada local de 29/10/2026 (100 mil contas, 600 + 600 TPS, 5 min por modo):
-
-- **Leitura válida nos dois modos:** fila zero. No modo `oracle`, avg 0,5 ms e p99 1,1 ms. No modo `oracle+valkey`, avg 0,2 ms e p99 0,5 ms.
-- **Ingestão não válida:** com 8 threads o ingestor satura a 600 TPS (`Fila ok = NÃO`, atraso de até 16 s). Para medir a ingestão, é preciso refazer a rodada com mais threads no ingestor.
-
-Os números locais servem para comparar os modos. Não representam o ATP-S na OCI.
+Se a Fila ou o TPS falharem, o gargalo pode ser o simulador ou a API, e não o banco. Nesse caso, aumente `--concurrency`, `API_WORKERS` ou `API_CPUS` antes de concluir algo.
 
 ## 6. Estrutura do repositório
 
 ```
-db/                 SQL: usuário (00) e schema (01)
-scripts/            ambiente.ps1, rodada.ps1, poc.ps1, mvn.ps1
-src/main/java/sentinela/
-  domain/           janelas, métricas, vetor de features e o port FeatureStorePort
-  adapter/oracle/   adapter Oracle e manutenção (job, backfill, retenção)
-  adapter/valkey/   adapter Valkey, scripts Lua e manutenção
-  workload/         gerador de carga, amostradores e dataset
-  report/           relatório
-  verification/     modelo de referência e cenário C
-  infra/            argumentos, ambiente, log CSV
-  app/              um ponto de entrada por programa
-src/main/resources/lua/   ingest.lua, put_day.lua
-Containerfile       imagem da POC
+src/sentinela/
+  domain/       janelas, limites, agregados e vetor de 95 features
+  db/           SQL de leitura, store assíncrono da API, manutenção, pool, schema, plano
+  api/          FastAPI (ingest e query API)
+  sim/          amostradores, dataset, runner open-loop, log CSV, programas de carga
+  report/       relatório
+  verification/ modelo de referência e cenário C
+  backfill.py   histórico do benchmark
+  cli.py        ponto de entrada: sentinela <programa>
+db/             SQL: usuário local (00), usuário no ATP (00_usuario_atp) e schema (01)
+scripts/        ambiente.sh, rodada.sh, test.sh, lib.sh
+tests/          unit/ e integration/
+Containerfile   imagem única (alvos base e test)
+compose.yaml    oracle (profile local-db), api e sim
 ```
 
 ## 7. Problemas comuns
 
 | Sintoma | Causa e solução |
 | --- | --- |
-| `Error: Could not find or load main class .timezone=UTC` | O PowerShell quebrou um argumento `-D...` no ponto. Coloque-o entre aspas: `'-Duser.timezone=UTC'`. |
-| `podman build` falha com `archive/tar: write too long` | Algum arquivo do contexto de build cresceu durante o build (um log, por exemplo). Pare o processo que escreve nele ou inclua o caminho no `.containerignore`. |
-| `ambiente.ps1` para em "aguardando o Oracle" na primeira vez | É normal: a criação do banco leva de 10 a 20 minutos. Acompanhe com `podman logs -f sentinela-oracle`. |
-| Programa sai com código 3 | O Oracle ou o Valkey não está acessível. Confira `podman ps --pod` e as URLs no `.env.local`. |
-| Testes de integração aparecem como *skipped* | O pod não existe, ou o `.env.local` não foi lido, ou os stores não estão em `localhost` (proteção dos testes destrutivos). |
-| Avisos `Set-PSReadLineOption` na saída | Vêm do perfil do PowerShell em execuções sem terminal e não afetam nada. Use `pwsh -NoProfile` para evitá-los. |
+| `ambiente.sh` para em "aguardando o Oracle" na primeira vez | É normal: a criação do banco leva de 10 a 20 minutos. Acompanhe com `podman logs -f sentinela-oracle` |
+| `API não respondeu /health` | O banco não está acessível pela API. Veja `podman logs sentinela-api` e o `ORACLE_DSN` |
+| Programa sai com código 3 | O Oracle ou a API não estão acessíveis. Confira `podman ps` e o `.env.local` |
+| No Windows, `bash scripts/...` no PowerShell falha com `pwsh`/`podman` não encontrado | O `bash` do PowerShell é o do WSL. Rode os scripts no **Git Bash** |
+| Testes de integração aparecem como *skipped* | O `ORACLE_DSN` não é local (proteção dos testes destrutivos) ou o `.env.local` não foi lido |
+| `podman build` falha com `archive/tar: write too long` | Um arquivo do contexto cresceu durante o build (um log, por exemplo). Inclua o caminho no `.containerignore` |
