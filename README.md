@@ -17,7 +17,8 @@ Documentação:
 - [Especificação funcional](docs/specs/Especificação%20funcional%20—%20POC%20Feature%20Store%20de%20Fraude.md): o quê e por quê.
 - [Especificação técnica](docs/specs/Especificação%20técnica%20—%20POC%20Feature%20Store%20de%20Fraude.md): como.
 - [Como a leitura consulta o Oracle](docs/leitura-oracle.md).
-- [Rodando na OCI](docs/oci.md): VM + Autonomous Database.
+- [Rodando na OCI](docs/oci.md): VM + Autonomous Database, com containers.
+- [Rodando na OCI sem containers](docs/oci-vm.md): VM + Autonomous Database, direto no Python da VM.
 
 ## 1. Requisitos
 
