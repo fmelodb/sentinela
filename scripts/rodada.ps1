@@ -5,9 +5,9 @@ param(
     [string] $Run = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss'),
     [int] $Tps = 600,
     [int] $Duration = 300,
-    [int] $Warmup = 30,
+    [int] $Warmup = 60,
     [int] $Accounts = 100000,
-    [int] $Threads = 8,
+    [int] $Threads = 16,
     [int] $Seed = 42
 )
 $ErrorActionPreference = 'Stop'
