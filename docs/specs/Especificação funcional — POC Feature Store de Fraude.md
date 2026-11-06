@@ -1,33 +1,37 @@
 # Especificação funcional — POC Feature Store de Fraude
 
-Oct 29, 2026 · @Fernando
+v2 · Nov 6, 2026 · @Fernando
+
+> A v1 (Java, modos `oracle` e `oracle+valkey`) está na tag `java-v1`. Esta versão só usa Oracle, é escrita em Python e expõe a ingestão e a leitura por HTTP.
 
 ## 1. Objetivo e escopo
 
-A POC prova que uma feature store de contadores em janelas de tempo, para detecção de fraude em um banco, pode ser servida com latência adequada a 600 leituras por segundo, e mede se o Oracle 26ai sozinho basta ou se o Valkey (OCI Cache) precisa entrar como camada de leitura.
+A POC prova que uma feature store de contadores em janelas de tempo, para detecção de fraude num banco, pode ser servida pelo **Oracle 26ai** com latência adequada a 600 leituras por segundo, sob 600 ingestões por segundo concorrentes, atrás de uma **ingest API** e de uma **query API** HTTP.
 
-O entregável é um benchmark reproduzível, rodando localmente em podman, que compara dois modos de serving com o mesmo código, o mesmo dataset e a mesma carga:
+O entregável é um benchmark reproduzível. Ele roda primeiro num desktop com podman e depois na OCI (VM + Autonomous Database), com o mesmo código, o mesmo dataset e a mesma carga.
 
-- Modo `oracle`: ingestão e leitura das features direto no Oracle.
-- Modo `oracle+valkey`: ingestão no Oracle e no Valkey; leitura das features no Valkey.
+São três componentes:
 
-A escolha do modo é um argumento de linha de comando dos programas de teste. O código de domínio não muda entre os modos (arquitetura hexagonal).
+| Componente | Papel |
+| --- | --- |
+| Oracle 26ai | Fonte da verdade e store de serving: `TX` e `DAILY_AGG`. Local: container Enterprise. OCI: ATP |
+| Container da API | FastAPI: ingest API e query API. Também roda as tarefas de banco (schema, backfill, job diário, equivalência) |
+| Container do simulador | Gera o dataset, chama as APIs à taxa alvo, registra a latência e produz o relatório |
 
-Fora de escopo da POC: Kafka real (substituído por um gerador de dados e um ingestor simulado), modelo de machine learning (o leitor para no vetor de features), autenticação, alta disponibilidade, multi-região, e outras chaves de agregação além de conta (merchant, dispositivo).
+Fora de escopo: Kafka real (substituído pelo simulador, que chama a ingest API), modelo de machine learning (o leitor para no vetor de features), autenticação, alta disponibilidade, multi-região, cache na frente do banco e chaves de agregação além de conta (merchant, dispositivo).
 
-Princípio: fazer o essencial. Sem framework de aplicação, sem HTTP entre os componentes, sem orquestrador. Programas Java de linha de comando, um banco, um cache, logs em arquivo e um gerador de relatório.
+Princípio: fazer o essencial. Duas APIs, um banco, logs em arquivo e um gerador de relatório. Sem orquestrador: compose num host só.
 
 ## 2. Glossário
 
 | Termo | Significado na POC |
 | --- | --- |
 | Conta (`account_id`) | Chave de agregação. Inteiro de 1 a N, onde N é parâmetro do gerador. |
-| Transação | Evento com `tx_id` (único), `account_id`, `ts` (instante de ingestão) e `amount` (valor monetário). |
+| Transação | Evento com `tx_id` (único), `account_id`, `ts` (instante do evento, enviado pelo cliente) e `amount` (valor monetário). |
 | Janela | Intervalo de tempo que termina no instante da leitura (`now`), inclusive: 19 janelas fixas (seção 3). |
 | Fatia (bucket) | Agregado (`cnt`, `sum`, `min`, `max`) das transações de uma conta em um dia civil fechado. Só as janelas de dias usam fatias; as demais são calculadas sobre as transações. |
 | Métrica | Agregação sobre as transações de uma janela: `cnt`, `sum`, `min`, `max`, `avg`. |
 | Vetor de features | Saída da leitura: 19 janelas × 5 métricas = 95 valores, em ordem fixa. |
-| Modo de serving | `oracle` ou `oracle+valkey`; define qual adapter responde a leitura. |
 | Dia fechado | Dia civil já encerrado (D-1 para trás), no fuso `FS_ZONE`. |
 | Dia corrente | O dia civil de `now`, de 00:00 até `now`. Janelas de dias somam dias fechados e o dia corrente. |
 
@@ -41,9 +45,9 @@ Cada leitura devolve, para uma conta, 95 valores: 5 métricas para cada uma das 
 | Horas | 1, 2, 3, 5, 6, 9, 12, 24, 48, 72 | Deslizante: `now − N < ts ≤ now` |
 | Dias | 7, 31, 62, 92 | Os N−1 dias fechados anteriores a hoje (D−(N−1) a D−1) mais o dia corrente, de 00:00 até `now` |
 
-Janelas deslizantes (minutos e horas) não se alinham a minuto nem a hora: a janela de N cobre sempre exatamente N, seja qual for o instante da consulta. O limite inferior é exclusivo e o superior, inclusivo. A precisão é a do `ts` da transação, o microssegundo, o que atende ao requisito do cliente de precisão ao segundo. A janela de 24 horas cobre as últimas 24 horas, e não o dia corrente.
+As janelas deslizantes (minutos e horas) não se alinham a minuto nem a hora: a janela de N cobre exatamente N, seja qual for o instante da consulta. O limite inferior é exclusivo e o superior, inclusivo. A precisão é a do `ts` da transação, o microssegundo, o que atende ao requisito do cliente de precisão ao segundo. A janela de 24 horas cobre as últimas 24 horas, e não o dia corrente.
 
-Janelas de dias seguem o dia civil de `FS_ZONE`. A janela de N dias soma N−1 dias fechados e o que já aconteceu hoje. Por isso cobre entre N−1 e N dias de calendário, conforme a hora da consulta; essa é a definição do cliente.
+As janelas de dias seguem o dia civil de `FS_ZONE`. A janela de N dias soma N−1 dias fechados e o que já aconteceu hoje. Por isso cobre entre N−1 e N dias de calendário, conforme a hora da consulta. Essa é a definição do cliente.
 
 Exemplo, para uma consulta em 29/10 às 17:23:40 (hora local):
 
@@ -59,7 +63,7 @@ Exemplo, para uma consulta em 29/10 às 17:23:40 (hora local):
 | 62d | dias fechados de 29/08 a 28/10, mais hoje até 17:23:40 |
 | 92d | dias fechados de 30/07 a 28/10, mais hoje até 17:23:40 |
 
-Essa definição é a mesma no Oracle e no Valkey, para que os dois adapters produzam vetores idênticos e o benchmark compare só latência. A regra do cliente ("sem transação na última hora, contadores até 1h zerados") é consequência: sem transações em `(now − 1h, now]`, as janelas até 1h ficam vazias.
+O SQL do Oracle e um modelo de referência independente, que calcula as janelas direto sobre a lista de transações, implementam a mesma definição. O cenário C (seção 10) exige vetores idênticos. A regra do cliente ("sem transação na última hora, contadores até 1h zerados") é consequência: sem transações em `(now − 1h, now]`, as janelas até 1h ficam vazias.
 
 Métricas por janela:
 
@@ -69,218 +73,170 @@ Métricas por janela:
 | `sum` | Soma de `amount` | 0 |
 | `min` | Menor `amount` | nulo |
 | `max` | Maior `amount` | nulo |
-| `avg` | `sum / cnt`, calculada na leitura, nunca armazenada | nulo |
+| `avg` | `sum / cnt`, calculada na leitura, nunca armazenada; 4 casas, arredondamento bancário | nulo |
 
-`cnt`, `sum`, `min` e `max` são decomponíveis: o valor de um intervalo é a combinação dos valores das suas partes (soma de somas, mínimo dos mínimos). Por isso a janela de dias é a combinação das fatias dos dias fechados com o agregado do dia corrente, e cada fatia armazena só esses quatro números. As janelas deslizantes são calculadas sobre as transações, porque o limite inferior pode cair em qualquer instante. Nada é materializado por janela.
+`cnt`, `sum`, `min` e `max` são decomponíveis: o valor de um intervalo é a combinação dos valores das suas partes (soma de somas, mínimo dos mínimos). Por isso a janela de dias combina as fatias dos dias fechados com o agregado do dia corrente, e cada fatia armazena só esses quatro números. As janelas deslizantes são calculadas sobre as transações, porque o limite inferior pode cair em qualquer instante. Nada é materializado por janela.
 
 Ordem do vetor: janelas na ordem da tabela acima (minutos, horas, dias); dentro de cada janela, `cnt`, `sum`, `min`, `max`, `avg`. Nome de cada posição: `<metrica>_<N><unidade>`, por exemplo `cnt_5m`, `sum_24h`, `max_31d`.
 
-## 4. Arquitetura hexagonal
+## 4. Arquitetura
 
-O domínio conhece um único contrato, `FeatureStorePort`, com duas operações: `ingest(transacao)` e `read(account_id, now) → vetor de 95 valores`. Dois adapters implementam o contrato; os programas de teste escolhem qual usar pelo argumento `--mode`.
+```
+simulador ──HTTP──► API (FastAPI) ──SQL──► Oracle 26ai
+  ingestor   POST /v1/transacoes             TX (particionada por dia)
+  leitor     GET  /v1/contas/{id}/features   DAILY_AGG (IOT)
+```
 
-&#91;embedded content: componentes da POC · 4 programas, 1 port, 2 adapters, 2 stores\]
+O simulador só conhece HTTP. A API é a única que fala com o banco. As tarefas de banco (schema, backfill, job diário e equivalência) são comandos de linha que rodam no container da API, porque é ele que tem as credenciais.
 
-Gerador, Ingestor, Leitor e Job diário são programas de linha de comando que usam a biblioteca em processo (sem HTTP). O `--mode` seleciona o adapter de leitura; a ingestão grava sempre no Oracle e, no modo `oracle+valkey`, também no Valkey. O Relatório (fora do desenho) só lê os arquivos de log que Ingestor e Leitor produzem.
+### Ingest API
 
-| Modo | `ingest` | `read` |
-| --- | --- | --- |
-| `oracle` | Adapter Oracle | Adapter Oracle |
-| `oracle+valkey` | Adapter Oracle e Adapter Valkey, em sequência no mesmo processo | Adapter Valkey |
+`POST /v1/transacoes` com corpo `{"tx_id": 1, "account_id": 4711, "ts": "2026-10-29T20:23:40.123456Z", "amount": 150.25}`.
 
-O domínio contém a definição das 19 janelas e 5 métricas (seção 3) e a montagem do vetor em ordem fixa. Nenhum adapter redefine janelas: o Adapter Oracle traduz a definição em SQL e o Adapter Valkey em filtro sobre as transações e fatias que lê. Um teste de contrato roda a mesma sequência de transações contra os dois adapters e exige vetores idênticos.
+| Resposta | Quando |
+| --- | --- |
+| `201 {"tx_id": 1, "duplicada": false}` | Transação gravada |
+| `200 {"tx_id": 1, "duplicada": true}` | O `tx_id` já existia: idempotência, nada muda |
+| `422` | Corpo inválido: `account_id` ≤ 0, `amount` ≤ 0 ou com mais de 2 casas, `ts` sem fuso |
+| `503` | Banco indisponível |
 
-Nota sobre o Kafka real: em produção os dois sinks seriam consumer groups independentes sobre o mesmo tópico, cada um idempotente. Na POC, com o Kafka abstraído, o Ingestor grava nos dois stores em sequência; isso é aceitável para medir latência, não é o desenho de produção.
+### Query API
+
+`GET /v1/contas/{account_id}/features[?now=<ISO-8601 com fuso>]` devolve `{"account_id", "now", "features": {"cnt_1m": …, …, "avg_92d": …}}`, com as 95 chaves na ordem da seção 3. Sem `now`, vale o relógio do servidor. O parâmetro serve à verificação (cenário C).
+
+Toda resposta que acessa o banco traz o header `Server-Timing: db;dur=<ms>`, com o tempo da chamada ao Oracle medido na API. Assim o relatório separa o custo do banco do custo do HTTP.
 
 ## 5. Componentes
 
-Seis programas Java de linha de comando, todos compartilhando a biblioteca da seção 4. Cada um faz uma coisa.
+| Programa | Onde roda | O que faz |
+| --- | --- | --- |
+| `api` | API | Sobe a ingest API e a query API (uvicorn, N processos) |
+| `schema` | API | Cria `TX` e `DAILY_AGG`. Idempotente |
+| `backfill` | API | Destrutivo: popula o histórico (transações desde 00:00 de D-3 em `TX` e 92 dias de `DAILY_AGG`) e confere o plano de execução real da leitura |
+| `job-diario` | API | Fecha o dia D-1 em `DAILY_AGG` e remove partições de `TX` com mais de 93 dias. Idempotente |
+| `equivalencia` | API | Cenário C: aplica uma sequência de transações pela ingest API, lê pela query API e compara com o modelo de referência |
+| `gerador` | Simulador | Produz o dataset NDJSON (`tx_id`, `account_id`, `amount`), determinístico por `seed` |
+| `ingestor` | Simulador | Chama a ingest API à taxa alvo, com `ts = agora` em cada transação. Substitui o consumer Kafka |
+| `leitor` | Simulador | Sorteia contas e chama a query API à taxa alvo. Substitui o serviço de scoring |
+| `carga` | Simulador | Ingestor e leitor ao mesmo tempo, em processos separados, com o mesmo `--run` |
+| `relatorio` | Simulador | Lê os logs e produz TPS, latências e validade da rodada (seção 8) |
 
-| Programa | O que faz | Entrada | Saída |
-| --- | --- | --- | --- |
-| Gerador | Produz o dataset de transações, determinístico por `seed`. Distribuição de contas configurável: uniforme ou concentrada (poucas contas com muitas transações, como em fraude real). | Parâmetros | Arquivo NDJSON, uma transação por linha: `tx_id`, `account_id`, `amount` |
-| Ingestor | Lê o dataset e aplica as transações nos stores à taxa alvo (TPS), atribuindo `ts = agora` a cada uma. Substitui o consumer Kafka. Mede a latência de cada `ingest`. | Dataset, `--mode`, `--tps`, `--duration` | Log de ingestão |
-| Leitor | Sorteia contas do mesmo universo e chama `read` à taxa alvo, montando o vetor de 95 valores. Substitui o serviço de scoring; não chama modelo. Mede a latência de cada `read`. | `--mode`, `--tps`, `--duration`, `--accounts` | Log de leitura |
-| Backfill | Popula histórico antes do benchmark: transações com `ts` no passado (últimas 72h) direto no Oracle, e `DAILY_AGG` para os 92 dias fechados. No modo `oracle+valkey`, reconstrói o Valkey a partir do Oracle. | `--mode`, `--days`, `--seed` | Stores populados |
-| Job diário | Agrega no Oracle as transações do dia D-1 em `DAILY_AGG`. No modo `oracle+valkey`, grava a fatia de dia no hash de cada conta que transacionou e remove fatias com mais de 91 dias. Executado sob demanda na POC. | `--mode`, `--day` | `DAILY_AGG` atualizada, Valkey atualizado |
-| Relatório | Lê os logs de Ingestor e Leitor e produz TPS e latências (seção 8). | Diretório de logs | Arquivo Markdown e CSV |
+O ingestor e o leitor rodam ao mesmo tempo: a leitura é medida sob ingestão concorrente, que é a condição real.
 
-Ingestor e Leitor rodam ao mesmo tempo durante o benchmark: a leitura é medida sob ingestão concorrente, que é a condição real. Rodar um sem o outro serve só para depuração.
+A carga é em laço aberto: a requisição k é agendada para `início + k/TPS`, quer as anteriores tenham terminado ou não. O atraso entre o instante agendado e o envio é medido à parte. É ele que mostra quando o cliente ou a API não dão conta.
 
-O Ingestor usa `ts = agora` em vez do timestamp do dataset para que as janelas deslizantes sejam exercitadas em tempo real durante a execução. O Backfill é quem coloca `ts` no passado.
+Idempotência: `tx_id` é chave primária em `TX`, então reaplicar o mesmo dataset não duplica, e a API responde `200 duplicada`.
 
-Idempotência: `tx_id` é chave primária no Oracle, então reaplicar o mesmo dataset não duplica. No Valkey, a transação só entra no sorted set da conta se o `tx_id` ainda não estiver lá, o que dá a mesma garantia dentro da retenção de 73 horas. Reentrega de transações mais antigas fica para a spec técnica de produção.
-
-## 6. Modelo de dados
-
-O Oracle é a fonte da verdade e guarda as transações; o Valkey é derivado e guarda, por conta, as transações recentes (72 horas e 1 de folga) e as fatias dos dias fechados. Nenhum dos dois armazena valores por janela.
-
-### Oracle 26ai
+## 6. Modelo de dados (Oracle 26ai)
 
 | Tabela | Colunas | Chave e índice | Particionamento |
 | --- | --- | --- | --- |
-| `TX` | `tx_id`, `account_id`, `ts` (timestamp), `amount` (número) | PK `tx_id`; índice local em `(account_id, ts)` | Interval por dia sobre `ts`, sem subpartição |
-| `DAILY_AGG` | `account_id`, `dia` (date), `cnt`, `sum`, `min`, `max` | PK `(account_id, dia)` | Nenhum |
+| `TX` | `tx_id`, `account_id`, `ts` (`TIMESTAMP(6)`, UTC), `amount` (`NUMBER(14,2)`) | PK `tx_id`; índice local coberto `(account_id, ts, amount)` | Interval por dia sobre `ts` |
+| `DAILY_AGG` | `account_id`, `dia` (`DATE`), `cnt`, `sum_amount`, `min_amount`, `max_amount` | PK `(account_id, dia)`, organizada por índice (IOT) | Nenhum |
 
-Leitura no Adapter Oracle: um único `SELECT` que varre `TX` da conta nas últimas 72 horas (poda para 4 partições) e calcula, com `COUNT`, `SUM`, `MIN`, `MAX` condicionais, as 15 janelas deslizantes e o agregado do dia corrente, mais um `SELECT` em `DAILY_AGG` para os dias fechados das 4 janelas de dias. Cada janela de dias é a combinação das duas partes. Os limites seguem a seção 3.
+A leitura é um único `SELECT`. Ele varre `TX` da conta nas últimas 72 horas (poda para até 4 partições, só no índice coberto) e calcula, com agregados condicionais, as 15 janelas deslizantes e o dia corrente. Em `CROSS JOIN`, agrega `DAILY_AGG` para os dias fechados das 4 janelas de dias. Cada janela de dias combina as duas partes. Detalhes em [leitura-oracle.md](../leitura-oracle.md).
 
-Retenção na POC: `TX` mantém 92 dias ou mais (necessário para recalcular `DAILY_AGG` e para o Backfill); partições antigas saem com `DROP PARTITION`.
+Retenção: `TX` mantém 93 dias; partições mais antigas saem com `DROP PARTITION` no job diário.
 
-### Valkey 7.2
+## 7. Parâmetros
 
-Duas chaves por conta, sem TTL: um sorted set com as transações das últimas 72 horas, que atende as janelas deslizantes e o dia corrente, e um hash com as fatias dos dias fechados.
-
-| Elemento | Formato | Exemplo | Retenção |
+| Argumento | Programas | Default | Significado |
 | --- | --- | --- | --- |
-| Transações recentes | sorted set `fs:{<account_id>}:tx` | `fs:{4711}:tx` | Últimas 73 horas: as 72 da maior janela e 1 de folga |
-| Score de uma transação | `ts` em microssegundos desde o epoch, UTC | `1793305420123456` | Segue o membro |
-| Membro de uma transação | `<tx_id>\|<amount>` | `98231\|450.00` | — |
-| Dias fechados | hash `fs:{<account_id>}` | `fs:{4711}` | — |
-| Fatia de dia | campo `d:<epoch_dia>` | `d:20754` | 91 campos: até 91 dias fechados |
-| Valor de uma fatia | `cnt\|sum\|min\|max` | `3\|450.00\|20.00\|300.00` | Segue o campo |
+| `--accounts` | gerador, leitor, carga, backfill, equivalencia | 100000 (1000 na equivalência) | Universo de contas |
+| `--tps` | ingestor, leitor | 600 | Taxa alvo |
+| `--tps-ingest`, `--tps-read` | carga | 600, 600 | Taxas alvo de cada fluxo |
+| `--duration` | ingestor, leitor, carga | 300 s | Tempo total |
+| `--warmup` | ingestor, leitor, carga | 30 s | Trecho inicial descartado pelo relatório |
+| `--concurrency` | ingestor, leitor, carga | 64 | Requisições HTTP em voo por fluxo |
+| `--seed` | gerador, leitor, carga, backfill, equivalencia | 42 | Reprodutibilidade dos sorteios |
+| `--distribution` | gerador, leitor, carga, backfill | `skewed` | `uniform` ou `skewed` (≈50% das transações em 1% das contas) |
+| `--dataset` | gerador, ingestor, carga | `./data/tx.ndjson` | Arquivo de transações |
+| `--days` | backfill | 92 | Dias de histórico |
+| `--day` | job-diario | D-1 | Dia a fechar |
+| `--run` | ingestor, leitor, carga | data/hora UTC | Nome da execução, que agrupa os logs |
 
-Ingestão no Adapter Valkey: para a transação, incluir o membro no sorted set se o `tx_id` ainda não estiver lá e remover os membros com mais de 73 horas. Essa operação precisa ser atômica por conta; a spec técnica decide entre script Lua e Valkey Functions.
-
-Leitura no Adapter Valkey: buscar no sorted set as transações de `(now − 72h, now]` e ler o hash dos dias fechados, e então combinar, para cada janela, as transações e fatias dentro do limite. A combinação pode rodar no cliente Java ou em Lua; a spec técnica decide com base na latência medida.
-
-Tamanho estimado, com o histórico do Backfill (5 transações por conta por dia): cerca de 15 membros por conta no sorted set, e até cerca de 1.000 nas contas quentes do modo `skewed`, mais 91 campos de dia. Com 100 mil contas no ambiente local, menos de 1 GB.
-
-## 7. Parâmetros dos programas
-
-Todos os programas aceitam os argumentos abaixo pela linha de comando; conexões vêm de variáveis de ambiente para não ir parar em logs.
-
-| Argumento | Programas | Valores | Default | Significado |
-| --- | --- | --- | --- | --- |
-| `--mode` | Ingestor, Leitor, Backfill, Job diário | `oracle`, `oracle+valkey` | `oracle` | Adapter de leitura e sinks de ingestão (seção 4) |
-| `--accounts` | Gerador, Leitor, Backfill | inteiro | 100000 | Tamanho do universo de contas |
-| `--tps` | Ingestor, Leitor | inteiro | 600 | Taxa alvo de operações por segundo |
-| `--duration` | Ingestor, Leitor | segundos | 300 | Tempo total de execução |
-| `--warmup` | Ingestor, Leitor | segundos | 30 | Trecho inicial descartado pelo Relatório |
-| `--seed` | Gerador, Leitor, Backfill | inteiro | 42 | Reprodutibilidade dos sorteios |
-| `--distribution` | Gerador, Leitor | `uniform`, `skewed` | `skewed` | Como as contas são sorteadas |
-| `--dataset` | Gerador (saída), Ingestor (entrada) | caminho | `./data/tx.ndjson` | Arquivo de transações |
-| `--days` | Backfill | inteiro | 92 | Dias de histórico a gerar |
-| `--day` | Job diário | `YYYY-MM-DD` | D-1 | Dia a fechar |
-| `--log` | Ingestor, Leitor | caminho | `./logs/<programa>-<mode>-<timestamp>.csv` | Arquivo de log de latência |
-| `--threads` | Ingestor, Leitor | inteiro | 8 | Paralelismo do cliente para atingir o TPS alvo |
-
-| Variável de ambiente | Programas | Significado |
-| --- | --- | --- |
-| `ORACLE_URL`, `ORACLE_USER`, `ORACLE_PASSWORD` | Todos exceto Gerador e Relatório | Conexão JDBC ao Oracle 26ai |
-| `VALKEY_URL` | Todos exceto Gerador e Relatório | Conexão ao Valkey; obrigatória só no modo `oracle+valkey` |
-
-O Relatório recebe o diretório de logs como único argumento e agrupa por programa e modo a partir do nome do arquivo e das colunas do log.
-
-## 8. Logs e relatório de benchmark
-
-Ingestor e Leitor escrevem uma linha por operação em um arquivo CSV; o Relatório transforma os arquivos em TPS e percentis. Nada de métricas em memória nem agregação durante a execução: o log bruto é a evidência.
-
-Formato do log, uma linha por operação, sem cabeçalho de texto livre:
-
-| Coluna | Tipo | Exemplo | Significado |
-| --- | --- | --- | --- |
-| `ts_epoch_ms` | inteiro | `1793296800123` | Instante de início da operação |
-| `program` | texto | `reader` | `ingestor` ou `reader` |
-| `mode` | texto | `oracle+valkey` | Modo em vigor |
-| `operation` | texto | `read` | `ingest_oracle`, `ingest_valkey`, `read` |
-| `account_id` | inteiro | `4711` | Conta da operação |
-| `latency_us` | inteiro | `842` | Duração em microssegundos, medida em volta da chamada ao port |
-| `status` | texto | `ok` | `ok` ou `error` |
-
-No modo `oracle+valkey`, o Ingestor registra duas linhas por transação (`ingest_oracle` e `ingest_valkey`), para que o custo de cada sink apareça separado.
-
-O Relatório produz, para cada combinação de `program`, `mode` e `operation`, descartando o trecho de `--warmup`:
-
-| Medida | Definição |
+| Variável de ambiente | Significado |
 | --- | --- |
-| Operações | Linhas com `status = ok`; erros contados à parte |
-| Duração | Do primeiro ao último `ts_epoch_ms` após o warmup |
-| TPS alcançado | Operações / duração; comparado ao `--tps` alvo |
-| Latência min, max, avg | Sobre `latency_us`, em milissegundos com uma casa decimal |
-| Latência p95, p99 | Percentis sobre `latency_us`, sem interpolação (valor observado) |
+| `ORACLE_DSN`, `ORACLE_USER`, `ORACLE_PASSWORD` | Conexão com o Oracle (só no container da API) |
+| `FS_ZONE` | Fuso do dia civil. Default `America/Sao_Paulo` |
+| `API_URL` | Onde o simulador encontra a API |
+| `API_WORKERS`, `DB_POOL_SIZE` | Processos do uvicorn e conexões por processo |
 
-Saídas: um Markdown com uma tabela por execução e uma tabela lado a lado dos modos quando os dois existirem no diretório, e um CSV com as mesmas linhas para planilha. O Relatório também emite TPS por segundo (série) para detectar quedas durante a execução, em CSV.
+## 8. Logs e relatório
 
-## 9. Ambiente local com podman
+O ingestor e o leitor escrevem uma linha por requisição num CSV, mais um `.meta.json` com os parâmetros e a medição de fila. O relatório transforma os arquivos em TPS e percentis. O log bruto é a evidência.
 
-Tudo roda em uma máquina, em um único pod podman com rede compartilhada. Dois containers de dados ficam de pé durante todo o benchmark; os programas Java sobem como containers de curta duração a partir de uma única imagem.
+| Coluna | Exemplo | Significado |
+| --- | --- | --- |
+| `ts_epoch_ms` | `1793296800123` | Início da requisição |
+| `program` | `leitor` | `ingestor` ou `leitor` |
+| `operation` | `read` | `ingest` ou `read` |
+| `account_id` | `4711` | Conta |
+| `latency_us` | `1842` | Duração da requisição HTTP vista pelo simulador |
+| `db_us` | `612` | Tempo do banco informado pela API (`Server-Timing`) |
+| `status` | `ok` | `ok` ou `error` |
 
-| Container | Imagem | Papel | Persistência |
-| --- | --- | --- | --- |
-| `oracle` | Oracle Database 26ai Free, imagem oficial do Oracle Container Registry | Fonte da verdade: `TX`, `DAILY_AGG` | Volume para datafiles; sobrevive a reinícios |
-| `valkey` | `valkey/valkey:7.2`, mesma linha de versão recomendada pelo OCI Cache | Online store do modo `oracle+valkey` | Sem persistência; reconstruído pelo Backfill |
-| `poc` (uma imagem, vários comandos) | Imagem Java construída da POC | Gerador, Ingestor, Leitor, Backfill, Job diário, Relatório | Volumes montados: `./data` e `./logs` |
+O relatório produz, por execução, programa e operação, sem o warmup: operações, erros, duração, TPS alcançado, latência HTTP e de banco (avg, p95, p99, max, percentis nearest-rank sem interpolação) e três verificações de validade:
 
-O Oracle 26ai Free tem limites de CPU e memória da edição gratuita; os números absolutos de latência locais não representam o ATP-S na OCI. O que a POC local valida é a diferença relativa entre os dois modos e a corretude. Os números de referência saem de uma segunda rodada na OCI, com os mesmos programas e `--mode`.
+| Verificação | Critério |
+| --- | --- |
+| TPS ok | Desvio do TPS alcançado em relação ao alvo menor que 5% |
+| Erro ok | Taxa de erro menor que 0,1% |
+| Fila ok | No máximo 1% das requisições após o warmup saiu mais de 100 ms depois do instante agendado |
 
-Escala local recomendada: 100 mil contas, 92 dias de histórico via Backfill, Ingestor e Leitor a 600 TPS cada por 5 minutos. O ambiente deve permitir subir para 300 mil contas sem mudar nada além de `--accounts`.
+Saídas: `report.md` (uma tabela por execução), `report.csv` e `tps-series.csv` (operações por segundo, para achar quedas).
 
-Ordem de execução de uma rodada:
+## 9. Ambientes
 
-1. Subir `oracle` e `valkey`; criar o schema (script SQL versionado no repositório).
-2. Gerador: produzir o dataset.
-3. Backfill no modo da rodada: histórico de 92 dias no Oracle e, se `oracle+valkey`, a reconstrução do Valkey.
-4. Ingestor e Leitor em paralelo, mesmo `--mode`, `--tps` e `--duration`.
-5. Relatório sobre `./logs`.
-6. Repetir 3 a 5 com o outro `--mode`, mesmo dataset e `--seed`, para a comparação lado a lado.
+| | Desktop | OCI |
+| --- | --- | --- |
+| Banco | Container Oracle 26ai Enterprise (profile `local-db` do compose) | Autonomous Database (ATP) 26ai, private endpoint |
+| API e simulador | Containers da mesma imagem, no compose | Os mesmos, numa VM Linux com podman |
+| Subir | `scripts/ambiente.sh up` | `scripts/ambiente.sh up --oci` |
 
-O Job diário é exercitado à parte, fechando um dia do histórico do Backfill, para validar a agregação e a escrita das fatias de dia; não faz parte da janela de medição.
+Os scripts são bash, porque a OCI não roda Windows. Os números locais servem para validar a corretude e o comportamento. Os de referência saem da rodada na OCI. O passo a passo da OCI está em [oci.md](../oci.md).
 
-## 10. Cenários de benchmark e critérios de aceitação
+Escala de referência: 100 mil contas, 92 dias de histórico, ingestor e leitor a 600 TPS cada por 5 minutos.
 
-A POC é aceita quando os três cenários abaixo rodam até o fim e o Relatório mostra os dois modos lado a lado, com o mesmo dataset e a mesma carga.
+## 10. Cenários e critérios de aceitação
 
-| Cenário | Modo | Carga | O que prova |
-| --- | --- | --- | --- |
-| A. Baseline Oracle | `oracle` | Ingestor 600 TPS + Leitor 600 TPS, 5 min | Latência de leitura e ingestão com um único store |
-| B. Oracle + Valkey | `oracle+valkey` | Igual a A | Latência de leitura no Valkey e custo adicional da dupla ingestão |
-| C. Equivalência | ambos | Sem carga: mesma sequência de transações aplicada nos dois adapters, leituras no mesmo instante lógico | Vetores idênticos nos dois adapters, para as 95 posições |
+| Cenário | Carga | O que prova |
+| --- | --- | --- |
+| A. Oracle atrás da API | Ingestor 600 TPS + Leitor 600 TPS, 5 min | Latência de leitura e de ingestão, separando HTTP e banco |
+| C. Equivalência | Sem carga: 1.000 contas, 93 dias de transações, leituras no mesmo instante lógico | API = modelo de referência nas 95 posições |
 
-Critérios funcionais, todos obrigatórios:
+Critérios funcionais:
 
-- [ ] `read` devolve 95 valores na ordem da seção 3, em ambos os modos.
+- [ ] A query API devolve 95 valores na ordem da seção 3.
 - [ ] Conta sem transações na última hora devolve `cnt = 0` em todas as janelas de minutos e na de 1h.
-- [ ] Janelas de dias incluem as transações do dia corrente até `now`.
-- [ ] Janelas deslizantes respeitam os limites da seção 3 ao microssegundo: uma transação em `now − N` fica fora e outra 1 µs depois entra; uma transação depois de `now` fica fora.
-- [ ] Cenário C passa sem divergência para pelo menos 1.000 contas sorteadas.
-- [ ] Reaplicar o mesmo dataset no Oracle não altera os contadores (idempotência por `tx_id`).
-- [ ] Job diário gera `DAILY_AGG` igual ao recálculo direto sobre `TX` para o dia fechado.
-- [ ] Relatório produz TPS alcançado e latência min, max, avg, p95, p99 por programa, modo e operação.
+- [ ] As janelas de dias incluem as transações do dia corrente até `now`.
+- [ ] As janelas deslizantes respeitam os limites da seção 3 ao microssegundo: uma transação em `now − N` fica fora e outra 1 µs depois entra; uma transação depois de `now` fica fora.
+- [ ] O cenário C passa sem divergência para pelo menos 1.000 contas.
+- [ ] Reaplicar a sequência pela ingest API devolve `200 duplicada` e não altera os contadores.
+- [ ] O job diário gera `DAILY_AGG` igual ao recálculo direto sobre `TX`.
 
-Critérios de carga, para a rodada local:
+Critérios de carga: TPS ok, Erro ok e Fila ok em todas as linhas do relatório.
 
-- [ ] Ingestor e Leitor sustentam o TPS alvo com desvio inferior a 5% após o warmup.
-- [ ] Taxa de erro inferior a 0,1% em ambos os modos.
+Não há meta de latência absoluta: o cliente não forneceu SLA.
 
-Não há meta de latência absoluta na POC: o cliente não forneceu SLA. O resultado esperado é a tabela comparativa dos modos, que alimenta a decisão de arquitetura (só ATP-S ou ATP-S + OCI Cache).
-
-## 11. Premissas, fora de escopo e questões abertas
-
-Premissas já fixadas, que a spec técnica herda sem rediscutir:
+## 11. Premissas e questões abertas
 
 | Premissa | Valor |
 | --- | --- |
-| Linguagem dos programas | Java (versão LTS corrente definida na spec técnica) |
-| Banco | Oracle Database 26ai Free local; ATP-S na OCI |
-| Cache | Valkey 7.2, a versão recomendada pelo OCI Cache |
-| Acesso ao Oracle | JDBC com UCP; um `SELECT` por leitura, sem PL/SQL obrigatório |
-| Acesso ao Valkey | Lettuce |
-| Estilo | Hexagonal: um port, dois adapters, seleção por `--mode` |
-| Sem framework de aplicação | Programas de linha de comando; sem HTTP, sem DI framework, sem orquestrador |
-| Kafka | Abstraído por Gerador + Ingestor |
-| Modelo de ML | Fora; o Leitor para no vetor |
+| Linguagem | Python 3.13 |
+| APIs | FastAPI + uvicorn |
+| Banco | Oracle 26ai: Enterprise em container no desktop, ATP na OCI |
+| Acesso ao Oracle | python-oracledb em modo thin (sem Instant Client), um `SELECT` por leitura |
+| Deploy na OCI | VM com compose; Container Instances e OKE ficam para depois |
+| Kafka | Abstraído pelo simulador, que chama a ingest API |
+| Modelo de ML | Fora; o leitor para no vetor |
 
-Fora de escopo, mesmo que apareça na conversa com o cliente: reentrega e exactly-once (não há Kafka), sharding do Valkey, réplicas e failover, chaves de agregação além de conta, métricas não decomponíveis (percentis, distintos), features point-in-time para treino (fica para o projeto, usando `TX`).
-
-Questões abertas com o cliente e o default assumido na POC:
-
-| Questão | Default na POC | Impacto se mudar |
+| Questão em aberto | Default na POC | Impacto se mudar |
 | --- | --- | --- |
-| TPS de ingestão (só o de leitura foi informado) | 600, igual ao de leitura | Só o parâmetro `--tps` do Ingestor |
-| SLA de latência p99 do scoring | Nenhum; a POC só compara | Vira critério de aceitação |
-| Métricas além de `cnt`: quais exatamente? | `cnt`, `sum`, `min`, `max`, `avg` | Métricas não decomponíveis mudam o modelo de dados |
-| Eventos atrasados ou fora de ordem | Não tratados; `ts` é o instante de ingestão | Ingestor passaria a usar o timestamp do evento |
-| Mesmas janelas para merchant ou dispositivo? | Não | Multiplica chaves no Valkey e índices no Oracle |
+| TPS de ingestão (só o de leitura foi informado) | 600, igual ao de leitura | Só `--tps-ingest` |
+| SLA de latência p99 do scoring | Nenhum | Vira critério de aceitação |
+| Eventos atrasados ou fora de ordem | Aceitos com o `ts` enviado; o job diário fecha D-1 | Reprocessar dias fechados |
+| Mesmas janelas para merchant ou dispositivo? | Não | Novos índices e tabelas de agregado |
 
 Questões decididas com o cliente em 29/10/2026, já refletidas na seção 3:
 

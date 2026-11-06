@@ -1,7 +1,10 @@
 .git
+.venv
 target
 data
 logs
 docs
 .env.local
 .superpowers
+**/__pycache__
+**/.pytest_cache

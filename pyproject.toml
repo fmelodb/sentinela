@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sentinela"
+version = "2.0.0"
+description = "POC Feature Store de Fraude: Oracle 26ai com ingest e query API em FastAPI"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+    "oracledb==3.1.1",
+    "orjson==3.10.18",
+    "aiohttp==3.11.18",
+    "numpy==2.2.6",
+    "tzdata==2025.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.26.0",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+sentinela = "sentinela.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sentinela"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: precisa do Oracle (destrutivo)"]
+addopts = "-ra"

@@ -2,7 +2,11 @@ data/
 logs/
 .env.local
 target/
-*.iml
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
 .idea/
 .vscode/
 .superpowers/

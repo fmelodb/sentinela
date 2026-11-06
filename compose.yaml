@@ -1,0 +1,51 @@
+# Três componentes: Oracle (só local, profile local-db), API e simulador.
+# Use pelos scripts: scripts/ambiente.sh up (desktop) ou scripts/ambiente.sh up --oci (VM na OCI, banco ATP).
+name: sentinela
+
+# podman-compose: sem pod, para recriar API e simulador sem tocar no Oracle. O Docker ignora.
+x-podman:
+  in_pod: false
+
+services:
+  oracle:
+    image: container-registry.oracle.com/database/enterprise:latest
+    container_name: sentinela-oracle
+    profiles: [local-db]
+    environment:
+      ORACLE_SID: ORCLCDB
+      ORACLE_PDB: SENTINELA
+      ORACLE_PWD: ${ORACLE_PWD}
+      INIT_SGA_SIZE: "4096"
+      INIT_PGA_SIZE: "2048"
+      ORACLE_CHARACTERSET: AL32UTF8
+    volumes:
+      - sentinela-oradata:/opt/oracle/oradata
+    ports:
+      - "1521:1521"
+
+  api:
+    image: localhost/sentinela:latest
+    container_name: sentinela-api
+    env_file: .env.local
+    command: ["sentinela", "api"]
+    cpus: ${API_CPUS:-8}
+    ports:
+      - "8000:8000"
+
+  sim:
+    image: localhost/sentinela:latest
+    container_name: sentinela-sim
+    env_file: .env.local
+    environment:
+      API_URL: http://api:8000
+    # Fica no ar; os programas rodam com podman exec sentinela-sim sentinela <programa>.
+    command: ["sleep", "infinity"]
+    cpus: ${SIM_CPUS:-4}
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+
+volumes:
+  sentinela-oradata:
+    external: true
+    name: sentinela-oradata
