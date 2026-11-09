@@ -20,6 +20,9 @@ TODAY = "hoje"
 # Início do SQL como o Oracle o guarda em V$SQL: usado para achar o cursor na conferência do plano.
 PREFIX = "WITH b AS (SELECT :1 AS lo_1m"
 COLUMNS = 4 * (len(ROLLING) + 1 + len(DAYS))
+# Fixa o índice coberto em TX. Com account_id assimétrico, um hard parse com bind ou estatística ruim levou o
+# ATP a TABLE ACCESS STORAGE FULL nas partições (80 ms e 10 mil gets por leitura, contra < 3 ms com o índice).
+TX_HINT = "/*+ INDEX(x tx_acc_ts_amt_ix) */"
 
 
 def _tx_aggregates(s: str, cond: str) -> str:
@@ -58,7 +61,7 @@ def _build() -> tuple[str, list]:
     d_where = (f"a.account_id = {bind(None)} AND a.dia >= {bind(oracledb.DB_TYPE_DATE)}"
                f" AND a.dia < {bind(oracledb.DB_TYPE_DATE)}")
     sql = (f"WITH b AS (SELECT {', '.join(b_cols)} FROM dual) SELECT t.*, d.* FROM ("
-           f"SELECT {', '.join(tx_cols)} FROM tx x CROSS JOIN b WHERE {tx_where}) t CROSS JOIN ("
+           f"SELECT {TX_HINT} {', '.join(tx_cols)} FROM tx x CROSS JOIN b WHERE {tx_where}) t CROSS JOIN ("
            f"SELECT {', '.join(d_cols)} FROM daily_agg a CROSS JOIN b WHERE {d_where}) d")
     return sql, types
 

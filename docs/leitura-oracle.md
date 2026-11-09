@@ -19,7 +19,8 @@ WITH b AS (                                   -- (A) a linha dos limites
 )
 SELECT t.*, d.*
 FROM (                                        -- (B) agregados sobre TX
-  SELECT COUNT(CASE WHEN x.ts >  b.lo_5m   THEN 1 END)        AS cnt_5m,
+  SELECT /*+ INDEX(x tx_acc_ts_amt_ix) */     -- fixa o índice coberto (seção 5)
+         COUNT(CASE WHEN x.ts >  b.lo_5m   THEN 1 END)        AS cnt_5m,
          SUM  (CASE WHEN x.ts >  b.lo_5m   THEN x.amount END) AS sum_5m,
          COUNT(CASE WHEN x.ts >= b.lo_hoje THEN 1 END)        AS cnt_hoje,
          ...
@@ -119,7 +120,24 @@ fechado. Ela é composta de duas partes:
 A aplicação combina as duas partes depois de ler a linha (`read_sql.parse`, com
 `WindowAgg.plus`): soma as contagens e as somas e toma o menor mínimo e o maior máximo.
 
-## 5. Resumo
+## 5. O plano e a hint de índice
+
+O plano esperado da subquery (B) é um `INDEX RANGE SCAN` em `TX_ACC_TS_AMT_IX` (índice local sobre
+`account_id, ts, amount`) dentro de `PARTITION RANGE ITERATOR`, **sem `TABLE ACCESS`**: o índice cobre todas
+as colunas lidas, e o intervalo de `ts` poda as partições. A subquery (C) usa a PK da IOT `DAILY_AGG`. O
+`backfill` confere esse plano (`db/plan.py`) e invalida a rodada se ele for outro.
+
+O `SELECT` de (B) leva a hint `/*+ INDEX(x tx_acc_ts_amt_ix) */` (constante `TX_HINT` em `read_sql.py`). Ela
+fica no bloco onde o alias `x` é definido; no `SELECT` externo o Oracle a ignoraria sem aviso.
+
+Motivo: num teste no ATP, o cursor da leitura foi otimizado com `TABLE ACCESS STORAGE FULL` nas partições
+recentes de `TX`. Cada leitura passou a custar ~80 ms de CPU e ~10 mil buffer gets, contra menos de 3 ms com o
+índice. Com 600 leituras/s, isso pede ~48 sessões ocupadas, mais que o pool (`API_WORKERS × DB_POOL_SIZE`). A
+latência HTTP subiu para ~300 ms, com o banco em 100% de CPU e sem espera. Com `account_id` assimétrico
+(`skewed`) e histograma, qualquer hard parse (estatística nova, partição nova, cursor que saiu do shared pool)
+pode repetir a escolha; a hint deixa o plano estável.
+
+## 6. Resumo
 
 | Etapa | Linhas |
 |---|---|
