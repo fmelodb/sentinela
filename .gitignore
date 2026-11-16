@@ -12,3 +12,4 @@ __pycache__/
 .superpowers/
 docs/artifacts
 
+.env.atps
