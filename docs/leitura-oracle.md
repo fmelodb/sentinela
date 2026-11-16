@@ -31,8 +31,20 @@ Uma transação (TRX):
  "S_CARD_ACCEPT_EXT_ID_CODE": "COM_A", "ORIGEN": "atmpos_trxs", "N_MTI": 200}
 ```
 
-ABR (notificação de dispositivo) e VU (evento de segurança) chegam do mesmo jeito, em `/v1/abr` e `/v1/vu`. Cada
-endpoint tem uma versão `/lote`, que recebe uma lista de até 10 mil eventos.
+São três fontes, de sistemas diferentes, cada uma com o seu endpoint:
+
+| Fonte | De onde vem | O que é | Endpoint |
+|---|---|---|---|
+| **TRX** | autorizador | cada transação da tarjeta CMR: monto, resposta, modo de entrada, país, MCC, comercio | `/v1/trx` |
+| **ABR** | notificações do dispositivo | atributos do aparelho do cliente (modelo, fabricante, sistema, ID do dispositivo…) a cada notificação | `/v1/abr` |
+| **VU** | plataforma de segurança | eventos de segurança do cliente, entre eles os de autenticação CPASS (tipos 999901 e 999903) | `/v1/vu` |
+
+ABR e VU chegam no mesmo formato que a TRX, com os nomes de coluna das suas fontes. Cada endpoint tem uma versão
+`/lote`, que recebe uma lista de até 10 mil eventos.
+
+As três fontes são **independentes**: cada evento é gravado e confirmado sozinho, sem transação entre fontes. A
+leitura só precisa que os eventos anteriores à compra avaliada já tenham chegado. Como as três subconsultas estão
+num único `SELECT`, o Oracle lê as três tabelas no mesmo instante, e uma leitura nunca vê metade de uma gravação.
 
 ### 1.2 Validação e hora local
 
@@ -300,16 +312,38 @@ modelo anterior, um hard parse escolheu `TABLE ACCESS STORAGE FULL` nas partiç�
 a custar ~80 ms de CPU, contra menos de 3 ms com o índice. Com clientes assimétricos e histograma, qualquer hard
 parse pode repetir a escolha; a hint deixa o plano estável.
 
-### 2.8 GET por ID_TRX
+### 2.8 POST ou GET: de onde vem a compra avaliada
 
-`GET /v1/features/{ID_TRX}` faz duas chamadas: primeiro busca a T0 pela PK de `TRX`
+Há duas formas de pedir as variáveis. A diferença é só **de onde vêm os dados da T0**; o cálculo e o resultado são
+os mesmos.
+
+| | `POST /v1/features` | `GET /v1/features/{ID_TRX}` |
+|---|---|---|
+| A T0 vem | no corpo: cliente, instante, monto, MCC, comercio | da tabela `TRX`, pelo ID |
+| A T0 precisa estar gravada | não | sim (senão, 404) |
+| Chamadas ao banco | 1 | 2: busca da T0 pela PK e a consulta da seção 2.3 |
+| Uso típico | quem chama tem a compra na mão, por exemplo durante a autorização, antes de gravá-la | a TRX já foi gravada e quem chama só tem o ID |
+
+A busca do GET é uma leitura pela PK:
 
 ```sql
 SELECT cliente, ts, monto, mcc, comercio, id_trx FROM trx WHERE id_trx = :id
 ```
 
-(~0,03 ms, 4 blocos) e depois roda a mesma consulta da seção 2.3. Se o ID não existe, responde 404. Com rede
-entre a API e o banco, o GET paga a ida e volta duas vezes.
+(~0,03 ms, 4 blocos). Com rede entre a API e o banco, o GET paga a ida e volta duas vezes.
+
+**Nas duas formas, a compra em trânsito não entra nas agregações de TRX.** Ela serve de referência: o instante
+ancora as janelas, o MCC e o comercio definem os filtros "mesmo MCC" e "mesmo comercio", e o monto é o numerador da
+V10. Mas as janelas de TRX vão de 1 s antes da T0 para trás (`delta ≥ 1`, regra do Excel); mesmo gravada, a
+própria compra fica em `delta = 0`, fora delas. Os testes conferem que GET e POST devolvem exatamente o mesmo
+resultado para a mesma compra.
+
+A exceção é o VU: a janela dele inclui o segundo da T0 (`delta ≥ 0`). Um evento de segurança com o mesmo instante
+da compra conta, nas duas formas, desde que tenha sido gravado antes da leitura.
+
+Incluir a compra em trânsito nas agregações (por exemplo, somar o monto dela nas aprovadas de 24 h) seria uma
+mudança de definição, não uma escolha entre GET e POST: mudaria a spec, a referência do Excel e o SQL, e precisa
+bater com o SQL de treino do modelo.
 
 ---
 
