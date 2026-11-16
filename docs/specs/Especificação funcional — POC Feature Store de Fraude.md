@@ -2,6 +2,8 @@
 
 v2 · Nov 6, 2026 · @Fernando
 
+> **Branch `xgboost-10-variaveis`:** este documento descreve o modelo de 95 features genéricas (tabelas `TX` e `DAILY_AGG`), que continua na branch `python`. Nesta branch, a leitura serve as 10 variáveis do XGBoost sobre TRX, ABR e VU: a definição está em [variaveis-xgboost.md](variaveis-xgboost.md), a consulta em [docs/leitura-oracle.md](../leitura-oracle.md) e a operação (endpoints, programas, benchmark, `importar`) no README. Valem daqui, sem mudança: o simulador em laço aberto, os critérios de validade da rodada (TPS, erro, fila), o relatório e a conferência do plano.
+
 > A v1 (Java, modos `oracle` e `oracle+valkey`) está na tag `java-v1`. Esta versão só usa Oracle, é escrita em Python e expõe a ingestão e a leitura por HTTP.
 
 ## 1. Objetivo e escopo

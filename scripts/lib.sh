@@ -1,12 +1,13 @@
 # Funções comuns dos scripts. Uso: . "$(dirname "$0")/lib.sh"
-# Variáveis que podem ser sobrescritas: CONTAINER (podman|docker), COMPOSE ("podman compose", "docker compose").
+# Variáveis que podem ser sobrescritas: ENV_FILE (default .env.local), CONTAINER (podman|docker),
+# COMPOSE ("podman compose", "docker compose").
 set -euo pipefail
 # Git Bash (Windows) converte argumentos como /opt/... em caminhos C:/...; desliga. No Linux não tem efeito.
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
-ENV_FILE=.env.local  # relativo: o script já está na raiz (caminhos /d/... não servem ao podman.exe)
+export ENV_FILE=${ENV_FILE:-.env.local}  # ex.: ENV_FILE=.env.podman; relativo à raiz (caminhos /d/... não servem ao podman.exe)
 CONTAINER=${CONTAINER:-podman}
 COMPOSE=${COMPOSE:-"$CONTAINER compose"}
 IMAGE=localhost/sentinela:latest

@@ -34,9 +34,12 @@ class Result:
 
 @dataclass
 class Step(Generic[T]):
-    operation: str
+    operation: str | Callable[[T], str]  # fixa, ou por item (o leitor mistura POST e GET)
     call: Call
-    account_of: Callable[[T], int]
+    client_of: Callable[[T], str]
+
+    def operation_of(self, item: T) -> str:
+        return self.operation if isinstance(self.operation, str) else self.operation(item)
 
 
 async def run(source: Iterator[T], step: Step[T], tps: int, duration_s: float, warmup_s: float,
@@ -67,7 +70,7 @@ async def run(source: Iterator[T], step: Step[T], tps: int, duration_s: float, w
             except Exception as e:  # noqa: BLE001 - o erro vira linha de log, não derruba a carga
                 ok, db_us = False, None
                 errors.report(e)
-            log.record(ts_ms, step.operation, step.account_of(item), (time.perf_counter_ns() - t0) // 1_000,
+            log.record(ts_ms, step.operation_of(item), step.client_of(item), (time.perf_counter_ns() - t0) // 1_000,
                        db_us, ok)
 
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]

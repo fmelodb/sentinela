@@ -1,100 +1,94 @@
-from datetime import date, datetime, timedelta
+"""Domínio: parsing com os nomes da fonte, classificação de TRX, agregação em memória e as 10 variáveis contra
+os casos do Excel."""
+
+import json
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from sentinela.domain.agg import EMPTY, NAMES, FeatureVector, Transaction, WindowAgg
-from sentinela.domain.windows import FIRST_DAY_WINDOW, ROLLING, SIZE, SUFFIXES, UTC, day_start, limits
+from sentinela.verification import scenarios
+from sentinela.api.models import AbrIn, T0In, TrxIn, VuIn
+from sentinela.domain import memory, variables
+from sentinela.domain.events import Abr, Trx, Vu, local_second
 
-SP = ZoneInfo("America/Sao_Paulo")
-NOW = datetime(2026, 10, 29, 15, 7, 30, 123456, tzinfo=UTC)
-
-
-def test_catalogo_tem_19_janelas_na_ordem_da_spec():
-    assert SIZE == 19 and FIRST_DAY_WINDOW == 15
-    assert SUFFIXES[0] == "1m" and SUFFIXES[14] == "72h" and SUFFIXES[-1] == "92d"
+SCL = ZoneInfo("America/Santiago")
+FIXTURE = scenarios.excel_fixture()
 
 
-def test_nomes_95_na_ordem():
-    assert len(NAMES) == 95
-    assert NAMES[:5] == ("cnt_1m", "sum_1m", "min_1m", "max_1m", "avg_1m")
-    assert NAMES[-1] == "avg_92d"
+def fixture_events():
+    trx = [TrxIn.model_validate(r).to_domain(SCL) for r in FIXTURE["trx"]]
+    abr = [AbrIn.model_validate(r).to_domain(SCL) for r in FIXTURE["abr"]]
+    vu = [VuIn.model_validate(r).to_domain(SCL) for r in FIXTURE["vu"]]
+    return trx, abr, vu
 
 
-def test_limites_deslizantes_ao_microssegundo():
-    lim = limits(NOW, SP)
-    assert lim.rolling_lo[0] == NOW - timedelta(minutes=1)
-    assert lim.oldest_rolling == NOW - timedelta(hours=72)
-    lo = lim.rolling_lo[0]
-    assert not lim.in_rolling(0, lo)
-    assert lim.in_rolling(0, lo + timedelta(microseconds=1))
-    assert lim.in_rolling(0, NOW)
-    assert not lim.in_rolling(0, NOW + timedelta(microseconds=1))
+def assert_vars(got: dict, want: dict) -> None:
+    assert list(got) == list(variables.NAMES)
+    for name, w in want.items():
+        if w is None:
+            assert got[name] is None, name
+        else:
+            assert got[name] == pytest.approx(w, rel=1e-12, abs=1e-12), name
 
 
-def test_dia_corrente_e_dias_fechados_no_fuso():
-    lim = limits(NOW, SP)
-    assert lim.today == date(2026, 10, 29)
-    assert lim.today_start == datetime(2026, 10, 29, 3, 0, tzinfo=UTC)  # 00:00 em São Paulo (UTC-3)
-    assert lim.closed_lo[0] == date(2026, 10, 23)  # 7d = 6 dias fechados + hoje
-    assert lim.oldest_closed == date(2026, 10, 29) - timedelta(days=91)
-    assert lim.in_closed(0, date(2026, 10, 28)) and not lim.in_closed(0, date(2026, 10, 29))
-    assert lim.in_today(lim.today_start) and not lim.in_today(lim.today_start - timedelta(microseconds=1))
+@pytest.mark.parametrize("caso", FIXTURE["casos"], ids=lambda c: c["caso"])
+def test_variaveis_batem_com_excel(caso):
+    trx, abr, vu = fixture_events()
+    t0_row = next(r for r in FIXTURE["trx"] if r["ID_TRX"] == caso["id_trx"])
+    t0 = T0In.model_validate(t0_row).to_domain(SCL)
+    got = variables.compute(memory.aggregate(t0, trx, abr, vu), t0.monto)
+    assert_vars(got, caso["esperado"])
 
 
-def test_virada_do_dia_local_antes_da_utc():
-    # 01:00 UTC de 30/10 ainda é 29/10 em São Paulo.
-    lim = limits(datetime(2026, 10, 30, 1, 0, tzinfo=UTC), SP)
-    assert lim.today == date(2026, 10, 29)
-    assert day_start(date(2026, 10, 30), SP) == datetime(2026, 10, 30, 3, 0, tzinfo=UTC)
+def test_nomes_iguais_aos_do_excel():
+    assert list(variables.NAMES) == FIXTURE["variaveis"]
 
 
-def test_limites_exigem_fuso():
+def test_local_second_converte_fuso_e_arredonda():
+    utc = datetime(2026, 9, 30, 15, 0, 0, 500_000, tzinfo=timezone.utc)
+    assert local_second(utc, SCL) == datetime(2026, 9, 30, 12, 0, 1)  # -03 em setembro
+    assert local_second(datetime(2026, 9, 30, 12, 0, 0, 499_999), SCL) == datetime(2026, 9, 30, 12, 0, 0)
+
+
+def _trx(**kw):
+    base = dict(id_trx="1", cliente="C", ts=datetime(2026, 9, 1, 10), monto=Decimal(10), response_code="00",
+                pcode=3000, entry_mode=9, pais=152, origen="atmpos_trxs", mti=200)
+    return Trx(**(base | kw))
+
+
+def test_classificacao_trx():
+    assert _trx().flags.ap and not _trx().flags.re
+    assert _trx(response_code=None).flags.re  # nula = rechazada
+    assert not _trx(pcode=1000).flags.ap and not _trx(pcode=1000).flags.re and _trx(pcode=1000).flags.base
+    assert not _trx(mti=210).flags.base and not _trx(origen="x").flags.base
+    assert _trx(entry_mode=None).flags.ap_aus and not _trx().flags.ap_aus
+    assert _trx(ts=datetime(2026, 9, 1, 5, 59, 59)).flags.ap_mad
+    assert not _trx(ts=datetime(2026, 9, 1, 22)).flags.ap_mad  # 22h é tarde-noche no Excel
+    npd = dict(response_code="05", ts=datetime(2026, 9, 1, 14, 59, 59))
+    assert _trx(**npd).flags.re_npd
+    assert _trx(**npd, pais=840, nombre_comercio="WEBPAY.CL X").flags.re_npd
+    assert not _trx(**npd, pais=840, nombre_comercio="webpay").flags.re_npd  # FIND é sensível a maiúsculas
+    assert not _trx(**(npd | {"ts": datetime(2026, 9, 1, 15)})).flags.re_npd
+
+
+def test_trx_exige_hora_local_ao_segundo():
     with pytest.raises(ValueError):
-        limits(datetime(2026, 1, 1), SP)
-
-
-def test_window_agg_plus():
-    a = WindowAgg.of(100).plus(WindowAgg.of(50))
-    assert a == WindowAgg(2, 150, 50, 100)
-    assert EMPTY.plus(a) == a and a.plus(EMPTY) == a
-
-
-def test_window_agg_invariantes():
+        _trx(ts=datetime(2026, 9, 1, 10, tzinfo=timezone.utc))
     with pytest.raises(ValueError):
-        WindowAgg(0, 1, None, None)
-    with pytest.raises(ValueError):
-        WindowAgg(1, 1, None, 1)
+        _trx(ts=datetime(2026, 9, 1, 10, 0, 0, 1))
 
 
-def test_transacao_valida():
-    with pytest.raises(ValueError):
-        Transaction(1, 0, NOW, 100)
-    with pytest.raises(ValueError):
-        Transaction(1, 1, NOW, 0)
-    with pytest.raises(ValueError):
-        Transaction(1, 1, datetime(2026, 1, 1), 100)
+def test_abr_valido_e_vu_cpass():
+    assert not Abr("C", datetime(2026, 1, 1)).valido
+    assert Abr("C", datetime(2026, 1, 1), random_seed="S").valido
+    assert Vu("C", datetime(2026, 1, 1), tipo=999903).cpass and not Vu("C", datetime(2026, 1, 1), tipo=999910).cpass
 
 
-def test_vetor_valores_e_json():
-    aggs = [EMPTY] * SIZE
-    aggs[0] = WindowAgg(3, 1000, 100, 700)  # avg = 10 / 3 = 3,3333
-    v = FeatureVector(tuple(aggs))
-    values = v.values()
-    assert values[:5] == [3, Decimal("10.00"), Decimal("1.00"), Decimal("7.00"), Decimal("3.3333")]
-    assert values[5:10] == [0, Decimal("0.00"), None, None, None]
-    j = v.to_json()
-    assert list(j) == list(NAMES)
-    assert j["cnt_1m"] == 3 and j["sum_1m"] == 10.0 and j["avg_1m"] == 3.3333 and j["min_5m"] is None
-
-
-def test_media_half_even():
-    aggs = [EMPTY] * SIZE
-    aggs[0] = WindowAgg(8, 1, 0, 1)  # 0,01 / 8 = 0,00125 → 0,0012
-    assert FeatureVector(tuple(aggs)).values()[4] == Decimal("0.0012")
-
-
-def test_vetor_exige_19_janelas():
-    with pytest.raises(ValueError):
-        FeatureVector((EMPTY,) * (len(ROLLING)))
+def test_t0_aceita_corpo_de_trx_com_extras():
+    t0 = T0In.model_validate({"N_ID_CUSTOMER": 42, "D_TRANSMISSION_DATE_AND_TIME": "2026-09-30T12:00:00",
+                              "F_AMOUNT_TRANSACTION": 150.5, "ES_T0": 1, "S_CARD_ACCEPT_EXT_ID_CODE": ""})
+    d = t0.to_domain(SCL)
+    assert d.cliente == "42" and d.comercio is None and d.monto == Decimal("150.5")

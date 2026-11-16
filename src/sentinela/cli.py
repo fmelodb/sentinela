@@ -1,14 +1,13 @@
 """sentinela <programa> [argumentos]. Códigos de saída: 0 ok, 1 verificação falhou, 2 uso, 3 store indisponível,
 4 rodada inválida, 5 erro inesperado.
 
-No container da API (falam com o Oracle):  api, schema, backfill, job-diario, equivalencia
-No container do simulador (só HTTP):        gerador, ingestor, leitor, carga, relatorio
+No container da API (falam com o Oracle):  api, schema, job-diario, backfill, equivalencia, importar --modo direto
+No container do simulador (só HTTP):        gerador, ingestor, leitor, carga, importar --modo api, relatorio
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
 import traceback
 from datetime import date, datetime, timedelta
@@ -17,6 +16,8 @@ from pathlib import Path
 from sentinela import errors
 from sentinela.config import Env
 from sentinela.errors import UsageError
+
+FONTES = ("trx", "abr", "vu")
 
 
 def exit_code_of(e: BaseException) -> int:
@@ -43,24 +44,34 @@ def _positive(s: str) -> int:
 
 
 def _non_negative(s: str) -> int:
-    v = int(s)
+    try:
+        v = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"precisa ser inteiro: {s}") from None
     if v < 0:
         raise argparse.ArgumentTypeError(f"não pode ser negativo: {s}")
     return v
 
 
-def _now(s: str | None) -> datetime:
-    from sentinela.domain.windows import UTC
-
-    if s is None:
-        return datetime.now(UTC)
+def _rate(s: str) -> float:
     try:
-        t = datetime.fromisoformat(s)
+        v = float(s)
     except ValueError:
-        raise UsageError(f"--now precisa ser ISO-8601, como 2026-10-29T15:07:30Z: {s}") from None
-    if t.tzinfo is None:
-        raise UsageError(f"--now precisa de fuso (Z ou ±hh:mm): {s}")
-    return t.astimezone(UTC)
+        raise argparse.ArgumentTypeError(f"precisa ser número: {s}") from None
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"não pode ser negativo: {s}")
+    return v
+
+
+def _fraction(s: str) -> float:
+    v = _rate(s)
+    if v > 1:
+        raise argparse.ArgumentTypeError(f"precisa estar entre 0 e 1: {s}")
+    return v
+
+
+def _local_now(env: Env) -> datetime:
+    return datetime.now(env.zone).replace(tzinfo=None, microsecond=0)
 
 
 # ---------------------------------------------------------------- programas que falam com o Oracle
@@ -87,20 +98,6 @@ def cmd_schema(a: argparse.Namespace) -> int:
     return errors.OK
 
 
-def cmd_backfill(a: argparse.Namespace) -> int:
-    from sentinela import backfill
-    from sentinela.db.pool import connect
-    from sentinela.sim.samplers import check_distribution
-
-    if not backfill.RECENT_DAYS <= a.days <= backfill.MAX_DAYS:
-        raise UsageError(f"--days precisa estar entre {backfill.RECENT_DAYS} e {backfill.MAX_DAYS}: {a.days}")
-    check_distribution(a.distribution)
-    env = Env.from_environ()
-    with connect(env) as conn:
-        backfill.run(conn, env.zone, a.accounts, a.days, a.seed, a.distribution, a.tx_per_day, _now(None))
-    return errors.OK
-
-
 def parse_day(s: str | None, today: date) -> date:
     if s is None:
         return today - timedelta(days=1)
@@ -114,53 +111,96 @@ def parse_day(s: str | None, today: date) -> date:
 
 
 def cmd_job(a: argparse.Namespace) -> int:
-    from sentinela.db.maintenance import Maintenance
+    from sentinela.db.maintenance import RETENTION_DAYS, Maintenance
     from sentinela.db.pool import connect
-    from sentinela.domain.windows import civil_day
 
     env = Env.from_environ()
-    today = civil_day(_now(None), env.zone)
-    day = parse_day(a.day, today)
+    today = datetime.now(env.zone).date()
+    if a.day is not None:
+        today = parse_day(a.day, today) + timedelta(days=1)
     with connect(env) as conn:
-        m = Maintenance(conn, env.zone)
-        print(f"job-diario: DAILY_AGG de {day} com {m.close_day(day)} contas", file=sys.stderr)
-        dropped = m.drop_old_partitions(today)
-        print(f"job-diario: partições removidas: {dropped or 'nenhuma'}", file=sys.stderr)
+        dropped = Maintenance(conn).drop_old_partitions(today)
+    print(f"job-diario: retenção de {RETENTION_DAYS} dias antes de {today}; partições removidas: "
+          f"{', '.join(dropped) or 'nenhuma'}", file=sys.stderr)
+    return errors.OK
+
+
+def cmd_backfill(a: argparse.Namespace) -> int:
+    from sentinela import backfill
+    from sentinela.db.pool import connect
+    from sentinela.sim.samplers import check_distribution
+
+    check_distribution(a.distribution)
+    if a.dias > backfill.MAX_DAYS:
+        raise UsageError(f"--dias no máximo {backfill.MAX_DAYS}")
+    env = Env.from_environ()
+    now = _local_now(env)
+    with connect(env) as conn:
+        total = backfill.run(conn, now, a.clientes, a.dias, a.seed, a.distribution,
+                             {"trx": a.trx_dia, "abr": a.abr_dia, "vu": a.vu_dia})
+    print(f"backfill: {total['trx']} TRX, {total['abr']} ABR, {total['vu']} VU; {a.clientes} clientes "
+          f"({a.distribution}), {a.dias} dias até {now} ({env.zone})", file=sys.stderr)
     return errors.OK
 
 
 def cmd_equivalencia(a: argparse.Namespace) -> int:
+    import asyncio
+
+    import aiohttp
+
     from sentinela.db.maintenance import Maintenance
     from sentinela.db.pool import connect
-    from sentinela.verification import check
+    from sentinela.verification import equivalence, scenarios
 
-    if a.accounts < 1000:
-        print(f"aviso: o critério de aceitação exige pelo menos 1.000 contas; rodando com {a.accounts}",
-              file=sys.stderr)
-    now = _now(a.now)
+    if not a.reset:
+        raise UsageError("a equivalência esvazia TRX, ABR e VU antes de ingerir os cenários; confirme com --reset")
     env = Env.from_environ()
-    api_url = (a.api_url or "http://localhost:8000").rstrip("/")
     with connect(env) as conn:
-        results = asyncio.run(check.run(Maintenance(conn, env.zone), api_url, env.zone, a.accounts, a.seed, now,
-                                        a.reset))
-    print(f"equivalencia em {now.isoformat()} ({env.zone}), {a.accounts} contas, seed {a.seed}, API {api_url}")
-    for r in results:
-        print(("PASS  " if r.passed else "FAIL  ") + r.name)
-        for d in r.details:
-            print("      " + d)
-    return errors.OK if all(r.passed for r in results) else errors.VERIFICATION_FAILED
+        Maintenance(conn).reset()
+    api_url = (a.api_url or env.api_url).rstrip("/")
+
+    async def go() -> equivalence.Report:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            client = equivalence.AiohttpClient(session, api_url)
+            return await equivalence.run(client, scenarios.all_scenarios(a.seed, a.clientes),
+                                         lambda m: print(f"equivalencia: {m}", file=sys.stderr))
+
+    rep = asyncio.run(go())
+    for line in rep.lines:
+        print(line)
+    print(f"equivalencia: {rep.passed} PASS, {rep.failed} FAIL ({api_url})", file=sys.stderr)
+    return errors.OK if rep.failed == 0 else errors.VERIFICATION_FAILED
+
+
+def cmd_importar(a: argparse.Namespace) -> int:
+    import asyncio
+
+    from sentinela import importar
+
+    path = Path(a.arquivo)
+    env = Env.from_environ()
+    if a.modo == "direto":
+        from sentinela.db.pool import connect
+
+        with connect(env) as conn:
+            s = importar.direto(conn, env.zone, a.fonte, path, a.sep)
+    else:
+        s = asyncio.run(importar.api((a.api_url or env.api_url).rstrip("/"), a.fonte, path, a.sep, a.lote))
+    importar.print_summary(a.fonte, a.modo, path, s)
+    return errors.OK if s.invalidas == 0 else errors.VERIFICATION_FAILED
 
 
 # ---------------------------------------------------------------- simulador
 
 def cmd_gerador(a: argparse.Namespace) -> int:
-    from sentinela.sim import dataset
+    from sentinela.sim import synth
     from sentinela.sim.samplers import check_distribution
 
     check_distribution(a.distribution)
-    dataset.generate(Path(a.dataset), a.accounts, a.count, a.seed, a.distribution)
-    print(f"gerador: {a.count} transações, {a.accounts} contas ({a.distribution}), seed {a.seed} -> {a.dataset}",
-          file=sys.stderr)
+    out = synth.generate(Path(a.dir), a.clientes, a.distribution, a.seed, {"trx": a.trx, "abr": a.abr, "vu": a.vu},
+                         _local_now(Env.from_environ()), a.dias)
+    print(f"gerador: {', '.join(f'{n} {f.upper()}' for f, n in out.items())}; {a.clientes} clientes "
+          f"({a.distribution}), seed {a.seed} -> {a.dir}", file=sys.stderr)
     return errors.OK
 
 
@@ -174,16 +214,20 @@ def _load_args(a: argparse.Namespace, run: str, log: str | None, tps: int | None
 
 def cmd_ingestor(a: argparse.Namespace) -> int:
     from sentinela.sim import load
+    from sentinela.sim.synth import dataset_path
 
-    return load.run_ingestor(_load_args(a, a.run or load.default_run(), a.log), Path(a.dataset))
+    path = Path(a.dataset) if a.dataset else dataset_path(Path(a.dir), a.fonte)
+    return load.run_ingestor(_load_args(a, a.run or load.default_run(), a.log), a.fonte, path, a.replay)
 
 
 def cmd_leitor(a: argparse.Namespace) -> int:
     from sentinela.sim import load
     from sentinela.sim.samplers import check_distribution
+    from sentinela.sim.synth import dataset_path
 
     check_distribution(a.distribution)
-    return load.run_leitor(_load_args(a, a.run or load.default_run(), a.log), a.accounts, a.seed, a.distribution)
+    return load.run_leitor(_load_args(a, a.run or load.default_run(), a.log), a.clientes, a.seed, a.distribution,
+                           a.fracao_get, dataset_path(Path(a.dir), "trx"), a.tps_trx)
 
 
 def cmd_carga(a: argparse.Namespace) -> int:
@@ -192,8 +236,10 @@ def cmd_carga(a: argparse.Namespace) -> int:
 
     check_distribution(a.distribution)
     run = a.run or load.default_run()
-    return load.carga(_load_args(a, run, None, a.tps_ingest), _load_args(a, run, None, a.tps_read),
-                      Path(a.dataset), a.accounts, a.seed, a.distribution)
+    ingest = {f: _load_args(a, run, None, tps) for f, tps in (("trx", a.tps_trx), ("abr", a.tps_abr),
+                                                              ("vu", a.tps_vu)) if tps > 0}
+    read = _load_args(a, run, None, a.tps_read) if a.tps_read > 0 else None
+    return load.carga(ingest, read, Path(a.dir), a.replay, a.clientes, a.seed, a.distribution, a.fracao_get)
 
 
 def cmd_relatorio(a: argparse.Namespace) -> int:
@@ -221,8 +267,8 @@ def _load_opts(p: argparse.ArgumentParser, tps: bool = True) -> None:
     p.add_argument("--api-url", help="default: $API_URL")
 
 
-def _reader_opts(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--accounts", type=_positive, default=100_000)
+def _client_opts(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--clientes", type=_positive, default=100_000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--distribution", default="skewed", help="skewed ou uniform")
 
@@ -238,56 +284,77 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=_positive, help="default: $API_WORKERS")
     p.set_defaults(fn=cmd_api)
 
-    p = sub.add_parser("schema", help="cria TX e DAILY_AGG (idempotente)")
+    p = sub.add_parser("schema", help="cria TRX, ABR e VU (idempotente)")
     p.add_argument("--arquivo", help="default: $SENTINELA_SCHEMA ou db/01_schema.sql")
     p.set_defaults(fn=cmd_schema)
 
-    p = sub.add_parser("backfill", help="destrutivo: popula 92 dias de histórico e confere o plano")
-    p.add_argument("--accounts", type=_positive, default=100_000)
-    p.add_argument("--days", type=int, default=92)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--distribution", default="skewed")
-    p.add_argument("--tx-per-day", type=_positive, default=5)
-    p.set_defaults(fn=cmd_backfill)
-
-    p = sub.add_parser("job-diario", help="fecha um dia em DAILY_AGG e remove partições antigas")
-    p.add_argument("--day", help="YYYY-MM-DD (default: D-1)")
+    p = sub.add_parser("job-diario", help="remove partições de TRX, ABR e VU fora da retenção (93 dias)")
+    p.add_argument("--day", help="último dia fechado, YYYY-MM-DD (default: D-1)")
     p.set_defaults(fn=cmd_job)
 
-    p = sub.add_parser("equivalencia", help="destrutivo: cenário C pela API contra o modelo de referência")
-    p.add_argument("--accounts", type=_positive, default=1000)
+    p = sub.add_parser("backfill", help="história sintética de TRX, ABR e VU direto no banco (destrutivo)")
+    _client_opts(p)
+    p.add_argument("--dias", type=_positive, default=92)
+    p.add_argument("--trx-dia", type=_rate, default=1.0, help="TRX por cliente por dia (default 1)")
+    p.add_argument("--abr-dia", type=_rate, default=0.5, help="ABR por cliente por dia (default 0,5)")
+    p.add_argument("--vu-dia", type=_rate, default=0.3, help="VU por cliente por dia (default 0,3)")
+    p.set_defaults(fn=cmd_backfill)
+
+    p = sub.add_parser("equivalencia", help="cenários do Excel e da spec pela API × referência (destrutivo)")
+    p.add_argument("--reset", action="store_true", help="confirma que TRX, ABR e VU serão esvaziadas")
+    p.add_argument("--clientes", type=_positive, default=25, help="clientes do cenário aleatório (default 25)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--now", help="ISO-8601 com fuso (default: agora)")
-    p.add_argument("--reset", action="store_true", help="apaga TX e DAILY_AGG antes")
-    p.add_argument("--api-url", help="default: http://localhost:8000 (a API do próprio container)")
+    p.add_argument("--api-url", help="default: $API_URL")
     p.set_defaults(fn=cmd_equivalencia)
 
-    p = sub.add_parser("gerador", help="gera o dataset NDJSON do ingestor")
-    p.add_argument("--accounts", type=_positive, default=100_000)
-    p.add_argument("--count", type=_positive, default=200_000)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--distribution", default="skewed")
-    p.add_argument("--dataset", default="./data/tx.ndjson")
+    p = sub.add_parser("importar", help="carrega um arquivo de uma fonte (NDJSON, JSON ou CSV, nomes originais)")
+    p.add_argument("--fonte", required=True, choices=FONTES)
+    p.add_argument("--arquivo", required=True)
+    p.add_argument("--modo", choices=("api", "direto"), default="api",
+                   help="api: endpoints de lote (default); direto: carga em massa no Oracle")
+    p.add_argument("--sep", default=",", help="separador do CSV (default ,)")
+    p.add_argument("--lote", type=_positive, default=1000, help="linhas por chamada no modo api (default 1000)")
+    p.add_argument("--api-url", help="default: $API_URL")
+    p.set_defaults(fn=cmd_importar)
+
+    p = sub.add_parser("gerador", help="gera <dir>/{trx,abr,vu}.ndjson para os ingestores")
+    _client_opts(p)
+    p.add_argument("--trx", type=_non_negative, default=200_000)
+    p.add_argument("--abr", type=_non_negative, default=60_000)
+    p.add_argument("--vu", type=_non_negative, default=30_000)
+    p.add_argument("--dias", type=_positive, default=1, help="eventos espalhados nos N dias até agora (default 1)")
+    p.add_argument("--dir", default="./data")
     p.set_defaults(fn=cmd_gerador)
 
-    p = sub.add_parser("ingestor", help="POST /v1/transacoes à taxa alvo, com ts = agora")
+    p = sub.add_parser("ingestor", help="POST /v1/<fonte> à taxa alvo, com o instante = agora")
     _load_opts(p)
-    p.add_argument("--dataset", default="./data/tx.ndjson")
-    p.add_argument("--log", help="default: ./logs/ingestor-<run>.csv")
+    p.add_argument("--fonte", choices=FONTES, default="trx")
+    p.add_argument("--dir", default="./data")
+    p.add_argument("--dataset", help="default: <dir>/<fonte>.ndjson")
+    p.add_argument("--replay", action="store_true", help="usa o instante do arquivo em vez de agora")
+    p.add_argument("--log", help="default: ./logs/ingestor_<fonte>-<run>.csv")
     p.set_defaults(fn=cmd_ingestor)
 
-    p = sub.add_parser("leitor", help="GET /v1/contas/{id}/features à taxa alvo")
+    p = sub.add_parser("leitor", help="POST /v1/features (compra sintética) e GET /v1/features/{ID_TRX}")
     _load_opts(p)
-    _reader_opts(p)
+    _client_opts(p)
+    p.add_argument("--fracao-get", type=_fraction, default=0.0,
+                   help="fração de GET por ID_TRX recém-ingerido (precisa do ingestor de TRX rodando; default 0)")
+    p.add_argument("--tps-trx", type=_non_negative, default=0, help="TPS do ingestor de TRX, para achar os IDs")
+    p.add_argument("--dir", default="./data")
     p.add_argument("--log", help="default: ./logs/leitor-<run>.csv")
     p.set_defaults(fn=cmd_leitor)
 
-    p = sub.add_parser("carga", help="ingestor e leitor ao mesmo tempo, em processos separados")
+    p = sub.add_parser("carga", help="ingestores de TRX, ABR e VU e o leitor ao mesmo tempo")
     _load_opts(p, tps=False)
-    p.add_argument("--tps-ingest", type=_positive, default=600)
-    p.add_argument("--tps-read", type=_positive, default=600)
-    p.add_argument("--dataset", default="./data/tx.ndjson")
-    _reader_opts(p)
+    _client_opts(p)
+    p.add_argument("--tps-trx", type=_non_negative, default=600)
+    p.add_argument("--tps-abr", type=_non_negative, default=200)
+    p.add_argument("--tps-vu", type=_non_negative, default=100)
+    p.add_argument("--tps-read", type=_non_negative, default=600)
+    p.add_argument("--fracao-get", type=_fraction, default=0.5, help="fração das leituras por GET (default 0,5)")
+    p.add_argument("--dir", default="./data")
+    p.add_argument("--replay", action="store_true", help="usa o instante dos arquivos em vez de agora")
     p.set_defaults(fn=cmd_carga)
 
     p = sub.add_parser("relatorio", help="report.md, report.csv e tps-series.csv em <dir>/report")

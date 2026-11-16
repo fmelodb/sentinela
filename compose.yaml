@@ -26,7 +26,7 @@ services:
   api:
     image: localhost/sentinela:latest
     container_name: sentinela-api
-    env_file: .env.local
+    env_file: ${ENV_FILE:-.env.local}
     command: ["sentinela", "api"]
     cpus: ${API_CPUS:-8}
     ports:
@@ -35,7 +35,7 @@ services:
   sim:
     image: localhost/sentinela:latest
     container_name: sentinela-sim
-    env_file: .env.local
+    env_file: ${ENV_FILE:-.env.local}
     environment:
       API_URL: http://api:8000
     # Fica no ar; os programas rodam com podman exec sentinela-sim sentinela <programa>.

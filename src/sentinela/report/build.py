@@ -20,7 +20,7 @@ class Row:
     ts_ms: int
     program: str
     operation: str
-    account_id: int
+    cliente: str
     latency_us: int
     db_us: int | None
     ok: bool
@@ -44,9 +44,9 @@ class LogFile:
     def warmup_s(self) -> int:
         return int(self.meta.get("warmup", 0))
 
-    @property
-    def target_tps(self) -> int:
-        return int(self.meta["tps"])
+    def target_tps(self, operation: str) -> int:
+        """O leitor divide o TPS entre POST e GET: o meta traz o alvo de cada operação."""
+        return int(self.meta.get("tps_by_operation", {}).get(operation, self.meta["tps"]))
 
 
 @dataclass(frozen=True)
@@ -125,7 +125,7 @@ def _rows(csv: Path, warn: TextIO) -> list[Row]:
             try:
                 if len(p) != 7:
                     raise ValueError
-                rows.append(Row(int(p[0]), sys.intern(p[1]), sys.intern(p[2]), int(p[3]), int(p[4]),
+                rows.append(Row(int(p[0]), sys.intern(p[1]), sys.intern(p[2]), p[3], int(p[4]),
                                 int(p[5]) if p[5] else None, p[6] == "ok"))
             except ValueError:
                 bad += 1
@@ -164,7 +164,7 @@ def _stats(f: LogFile, op: str, rows: list[Row]) -> GroupStats | None:
     last = max(r.ts_ms for r in rows)
     duration_s = max(1, last - first) / 1000.0
     achieved = len(ok) / duration_s
-    target = f.target_tps
+    target = f.target_tps(op)
     deviation = abs(achieved - target) / target
     error_rate = errors / len(rows)
     dbs = [r.db_us for r in ok if r.db_us is not None]

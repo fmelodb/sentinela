@@ -1,152 +1,93 @@
-"""Operações fora do caminho quente: Job diário, retenção, reset, carga em massa, leitura síncrona e plano."""
+"""Operações fora do caminho quente: reset, carga em massa, retenção, leitura síncrona e plano."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Iterator
-from datetime import date, datetime, timedelta, tzinfo
+from collections.abc import Iterable
+from datetime import date, datetime, timedelta
 
 import oracledb
 
-from sentinela.db import read_sql
-from sentinela.db.convert import cents, naive_utc
-from sentinela.domain.agg import FeatureVector, WindowAgg
-from sentinela.domain.windows import day_start, limits
+from sentinela.db import read_sql, rows
+from sentinela.db.rows import Kind, LoteResult
+from sentinela.domain import variables
+from sentinela.domain.events import T0
 
-TX_RETENTION_DAYS = 93
+RETENTION_DAYS = 93
 BATCH = 5_000
-COMMIT_EVERY = 50_000
 _HIGH_VALUE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-
-_RECALC = ("SELECT account_id, COUNT(*), SUM(amount), MIN(amount), MAX(amount)"
-           " FROM tx WHERE ts >= :ini AND ts < :fim GROUP BY account_id")
-_STORED = "SELECT account_id, cnt, sum_amount, min_amount, max_amount FROM daily_agg WHERE dia = :dia"
-
-# Valores em centavos inteiros; a divisão por 100 é exata no NUMBER do Oracle.
-_INSERT_TX = "INSERT INTO tx (tx_id, account_id, ts, amount) VALUES (:1, :2, :3, :4 / 100)"
-_INSERT_DAILY = ("INSERT INTO daily_agg (account_id, dia, cnt, sum_amount, min_amount, max_amount)"
-                 " VALUES (:1, :2, :3, :4 / 100, :5 / 100, :6 / 100)")
-
-
-def _dia(d: date) -> datetime:
-    return datetime(d.year, d.month, d.day)
 
 
 class Maintenance:
-    def __init__(self, conn: oracledb.Connection, zone: tzinfo):
+    def __init__(self, conn: oracledb.Connection):
         self.conn = conn
-        self.zone = zone
-
-    def _bounds(self, d: date) -> dict:
-        return {"ini": naive_utc(day_start(d, self.zone)), "fim": naive_utc(day_start(d + timedelta(days=1), self.zone))}
-
-    def _scalar(self, sql: str, **binds) -> int:
-        with self.conn.cursor() as cur:
-            cur.execute(sql, binds)
-            return int(cur.fetchone()[0])
 
     def reset(self) -> None:
         with self.conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE tx DROP ALL STORAGE")
-            cur.execute("TRUNCATE TABLE daily_agg")
+            for t in rows.TABLES:
+                cur.execute(f"TRUNCATE TABLE {t} DROP ALL STORAGE")
 
-    def is_empty(self) -> bool:
-        return self._scalar("SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM tx FETCH FIRST 1 ROWS ONLY))"
-                            " + (SELECT COUNT(*) FROM (SELECT 1 FROM daily_agg FETCH FIRST 1 ROWS ONLY)) FROM dual") == 0
-
-    def count_tx(self) -> int:
-        return self._scalar("SELECT COUNT(*) FROM tx")
-
-    def close_day(self, d: date) -> int:
-        """Recalcula DAILY_AGG do dia d a partir de TX, numa transação. Idempotente."""
+    def count(self, table: str) -> int:
+        if table not in rows.TABLES:
+            raise ValueError(table)
         with self.conn.cursor() as cur:
-            try:
-                cur.execute("DELETE FROM daily_agg WHERE dia = :dia", dia=_dia(d))
-                cur.setinputsizes(dia=oracledb.DB_TYPE_DATE, ini=oracledb.DB_TYPE_TIMESTAMP,
-                                  fim=oracledb.DB_TYPE_TIMESTAMP)
-                cur.execute("INSERT INTO daily_agg (account_id, dia, cnt, sum_amount, min_amount, max_amount)"
-                            " SELECT account_id, :dia, COUNT(*), SUM(amount), MIN(amount), MAX(amount)"
-                            " FROM tx WHERE ts >= :ini AND ts < :fim GROUP BY account_id",
-                            dia=_dia(d), **self._bounds(d))
-                n = cur.rowcount
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            return int(cur.fetchone()[0])
+
+    def bulk_insert(self, kind: Kind, events: Iterable) -> LoteResult:
+        """Insere em lotes, com commit por lote. Duplicatas da chave única são contadas e ignoradas."""
+        total = novas = dup = 0
+        erros: list[dict] = []
+        with self.conn.cursor() as cur:
+            batch: list[tuple] = []
+
+            def flush() -> None:
+                nonlocal total, novas, dup
+                cur.setinputsizes(*kind.types)
+                cur.executemany(kind.sql, batch, batcherrors=True)
+                r = rows.lote_result(len(batch), cur.getbatcherrors())
                 self.conn.commit()
-                return n
-            except oracledb.Error:
-                self.conn.rollback()
-                raise
+                erros.extend({"indice": e["indice"] + total, "erro": e["erro"]} for e in r.erros)
+                total += r.recebidas
+                novas += r.novas
+                dup += r.duplicadas
+                batch.clear()
 
-    def check_day(self, d: date) -> int:
-        """Linhas divergentes entre DAILY_AGG e o recálculo direto sobre TX (0 = igual)."""
-        sql = (f"SELECT COUNT(*) FROM (({_STORED} MINUS {_RECALC}) UNION ALL ({_RECALC} MINUS {_STORED}))")
-        return self._scalar(sql, dia=_dia(d), **self._bounds(d))
-
-    def daily_rows(self, d: date) -> list[tuple[int, WindowAgg]]:
-        with self.conn.cursor() as cur:
-            cur.execute(_STORED + " ORDER BY account_id", dia=_dia(d))
-            return [(int(r[0]), WindowAgg(int(r[1]), cents(r[2]), cents(r[3]), cents(r[4]))) for r in cur]
+            for e in events:
+                batch.append(kind.binds(e))  # type: ignore[operator]
+                if len(batch) == BATCH:
+                    flush()
+            if batch:
+                flush()
+        return LoteResult(total, novas, dup, erros)
 
     def drop_old_partitions(self, today: date) -> list[str]:
-        cutoff = naive_utc(day_start(today - timedelta(days=TX_RETENTION_DAYS), self.zone))
+        """Remove as partições diárias inteiramente anteriores a today − RETENTION_DAYS (hora local)."""
+        cutoff = datetime.combine(today - timedelta(days=RETENTION_DAYS), datetime.min.time())
+        dropped = []
         with self.conn.cursor() as cur:
-            cur.execute("SELECT partition_name, high_value FROM user_tab_partitions"
-                        " WHERE table_name = 'TX' AND partition_position > 1 ORDER BY partition_position")
-            candidates = []
-            for name, high in cur.fetchall():
-                m = _HIGH_VALUE.search(high or "")
-                if m and datetime.fromisoformat(m.group(1)) <= cutoff:
-                    candidates.append(name)
-            for name in candidates:
-                cur.execute(f'ALTER TABLE tx DROP PARTITION "{name}" UPDATE GLOBAL INDEXES')
-        return candidates
+            for table in rows.TABLES:
+                cur.execute("SELECT partition_name, high_value FROM user_tab_partitions"
+                            " WHERE table_name = :t AND partition_position > 1 ORDER BY partition_position",
+                            t=table.upper())
+                for name, high in cur.fetchall():
+                    m = _HIGH_VALUE.search(high or "")
+                    if m and datetime.fromisoformat(m.group(1)) <= cutoff:
+                        cur.execute(f'ALTER TABLE {table} DROP PARTITION "{name}" UPDATE GLOBAL INDEXES')
+                        dropped.append(f"{table}.{name}")
+        return dropped
 
     def gather_stats(self) -> None:
         with self.conn.cursor() as cur:
-            cur.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'TX');"
-                        " DBMS_STATS.GATHER_TABLE_STATS(USER, 'DAILY_AGG'); END;")
+            cur.execute("BEGIN FOR t IN (SELECT column_value n FROM TABLE(sys.odcivarchar2list('TRX','ABR','VU')))"
+                        " LOOP DBMS_STATS.GATHER_TABLE_STATS(USER, t.n); END LOOP; END;")
 
-    def bulk_insert_tx(self, rows: Iterable[tuple[int, int, datetime, int]]) -> int:
-        """rows: (tx_id, account_id, ts naive UTC, centavos)."""
-        return self._bulk(_INSERT_TX, (None, None, oracledb.DB_TYPE_TIMESTAMP, None), iter(rows))
-
-    def bulk_insert_daily(self, d: date, rows: Iterable[tuple[int, int, int, int, int]]) -> int:
-        """rows: (account_id, cnt, soma, mínimo, máximo), valores em centavos."""
-        dia = _dia(d)
-        return self._bulk(_INSERT_DAILY, (None, oracledb.DB_TYPE_DATE, None, None, None, None),
-                          ((acc, dia, c, s, mn, mx) for acc, c, s, mn, mx in rows))
-
-    def _bulk(self, sql: str, types: tuple, rows: Iterator[tuple]) -> int:
-        n = 0
-        since_commit = 0
-        with self.conn.cursor() as cur:
-            try:
-                batch: list[tuple] = []
-                for r in rows:
-                    batch.append(r)
-                    if len(batch) == BATCH:
-                        cur.setinputsizes(*types)
-                        cur.executemany(sql, batch)
-                        n += len(batch)
-                        since_commit += len(batch)
-                        batch = []
-                        if since_commit >= COMMIT_EVERY:
-                            self.conn.commit()
-                            since_commit = 0
-                if batch:
-                    cur.setinputsizes(*types)
-                    cur.executemany(sql, batch)
-                    n += len(batch)
-                self.conn.commit()
-            except oracledb.Error:
-                self.conn.rollback()
-                raise
-        return n
-
-    def read(self, account_id: int, now: datetime) -> FeatureVector:
+    def features(self, t0: T0) -> dict[str, variables.Value]:
         """A mesma leitura da API, síncrona: usada pela conferência do plano e pelos testes."""
         with self.conn.cursor() as cur:
-            cur.setinputsizes(*read_sql.INPUT_TYPES)
-            cur.execute(read_sql.SQL, read_sql.binds(account_id, limits(now, self.zone)))
-            return read_sql.parse(cur.fetchone())
+            cur.setinputsizes(**read_sql.INPUT_TYPES)
+            cur.execute(read_sql.SQL, read_sql.binds(t0))
+            return variables.compute(read_sql.parse(cur.fetchone()), t0.monto)
 
     def read_plan(self) -> list[str]:
         with self.conn.cursor() as cur:
@@ -156,6 +97,6 @@ class Maintenance:
             row = cur.fetchone()
             if row is None:
                 raise RuntimeError("SQL de leitura não encontrado em V$SQL; execute uma leitura antes")
-            cur.execute("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:1, :2, 'BASIC +PARTITION'))",
+            cur.execute("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:1, :2, 'BASIC'))",
                         [row[0], int(row[1])])
             return [r[0] for r in cur]

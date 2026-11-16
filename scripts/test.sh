@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Testes no container (o host não precisa de Python). Os de integração precisam do Oracle local no ar
-# (scripts/ambiente.sh up) e são DESTRUTIVOS: esvaziam TX e DAILY_AGG.
+# (scripts/ambiente.sh up) e são DESTRUTIVOS: esvaziam TRX, ABR e VU.
 #
 #   scripts/test.sh                  todos
 #   scripts/test.sh tests/unit       só unitários

@@ -1,4 +1,4 @@
-"""Cria TX e DAILY_AGG no schema de ORACLE_USER a partir de db/01_schema.sql. Idempotente."""
+"""Cria TRX, ABR e VU no schema de ORACLE_USER a partir de db/01_schema.sql. Idempotente."""
 
 from __future__ import annotations
 

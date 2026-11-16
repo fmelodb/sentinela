@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TextIO
 
-HEADER = "ts_epoch_ms,program,operation,account_id,latency_us,db_us,status"
+HEADER = "ts_epoch_ms,program,operation,cliente,latency_us,db_us,status"
 FLUSH_EVERY = 4096
 
 
@@ -42,9 +42,9 @@ class CsvLog:
         self._f.write(HEADER + "\n")
         self._buf: list[str] = []
 
-    def record(self, ts_ms: int, operation: str, account_id: int, latency_us: int, db_us: int | None,
+    def record(self, ts_ms: int, operation: str, cliente: str, latency_us: int, db_us: int | None,
                ok: bool) -> None:
-        self._buf.append(f"{ts_ms},{self.program},{operation},{account_id},{latency_us},"
+        self._buf.append(f"{ts_ms},{self.program},{operation},{cliente},{latency_us},"
                          f"{'' if db_us is None else db_us},{'ok' if ok else 'error'}\n")
         if len(self._buf) >= FLUSH_EVERY:
             self.flush()

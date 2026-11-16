@@ -1,4 +1,4 @@
-"""Testes contra o Oracle. São destrutivos (esvaziam TX e DAILY_AGG): só rodam se ORACLE_DSN apontar para o
+"""Testes contra o Oracle. São destrutivos (esvaziam TRX, ABR e VU): só rodam se ORACLE_DSN apontar para o
 banco local (host oracle ou localhost), ou com FS_IT_DESTRUCTIVE=1 definido explicitamente."""
 
 import os
@@ -42,13 +42,13 @@ def conn(env):
     from sentinela.db.pool import connect
 
     c = connect(env)
-    Maintenance(c, env.zone).reset()
+    Maintenance(c).reset()
     yield c
     c.close()
 
 
 @pytest.fixture
-def m(conn, env):
+def m(conn):
     from sentinela.db.maintenance import Maintenance
 
-    return Maintenance(conn, env.zone)
+    return Maintenance(conn)

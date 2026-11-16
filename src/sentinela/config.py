@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sentinela.errors import UsageError
 
-DEFAULT_ZONE = "America/Sao_Paulo"
+DEFAULT_ZONE = "America/Santiago"
 DEFAULT_API_URL = "http://localhost:8000"
 
 
