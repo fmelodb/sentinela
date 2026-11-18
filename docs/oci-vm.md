@@ -147,7 +147,7 @@ cat logs/report/report.md
 | Passo | O que faz | Onde grava |
 | --- | --- | --- |
 | 1. `gerador` | Gera os eventos que a carga vai postar. Os IDs começam com `G` (TRX), `GA` (ABR) e `GV` (VU) | `data/trx.ndjson`, `data/abr.ndjson`, `data/vu.ndjson` |
-| 2. `backfill` | Esvazia as três tabelas e grava, direto no banco, 92 dias de história até agora. É a base que as leituras consultam | `TRX`, `ABR` e `VU` no ATP |
+| 2. `backfill` | Esvazia as três tabelas e grava, direto no banco, 92 dias de história até agora. É a base que as leituras consultam. `--trx-dia`, `--abr-dia` e `--vu-dia` são a média de eventos **por cliente por dia** de cada fonte: com 100 mil clientes, 1 / 0,5 / 0,3 dão 100 mil TRX, 50 mil ABR e 30 mil VU por dia (~16,5 milhões de linhas em 92 dias). Com a distribuição `skewed` (default), metade dos eventos cai em 1% dos clientes | `TRX`, `ABR` e `VU` no ATP |
 | 3. `carga` | Posta os eventos do passo 1 pela API, com o instante trocado por agora, e lê as variáveis ao mesmo tempo | ATP (pela API) e logs em `./logs` |
 | 4. `relatorio` | Agrega os logs da carga em tabelas de latência e vazão | `logs/report/` |
 
