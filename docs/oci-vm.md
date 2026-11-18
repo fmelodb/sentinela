@@ -12,6 +12,8 @@ Neste modo, a API e o simulador rodam **direto na VM Linux**, num virtualenv Pyt
 
 Os scripts `scripts/ambiente.sh` e `scripts/rodada.sh` **não servem neste modo**, porque usam `podman exec`. A seção 6 traz os mesmos passos, um comando por vez.
 
+Este guia cobre só o **benchmark sintético**: dados gerados pelo próprio projeto, para medir latência e vazão. A carga de dados reais e a operação de produção (importação, job diário) ficam fora dele.
+
 ## 1. Autonomous Database
 
 Igual ao modo com containers: siga a [seção 1 do oci.md](oci.md#1-autonomous-database). Em resumo:
@@ -104,83 +106,129 @@ curl -s localhost:8000/health    # {"status":"ok","versao":"excel-2026-11-13"}
 
 **Isolamento de CPU:** sem containers, o `taskset` substitui `API_CPUS` e `SIM_CPUS`. Ele fixa a API e o simulador em núcleos diferentes, para o simulador não roubar CPU da API e distorcer o HTTP p99. O exemplo é para 16 vCPUs, com a API em 0–11 e o simulador em 12–15. Para ver quantas vCPUs a VM tem, use `nproc`.
 
-## 5. Conferir a corretude: equivalência
+## 5. Conferência de corretude (opcional)
 
-Na janela 2. Esvazia `TRX`, `ABR` e `VU`, ingere pela API os 6 casos do Excel e os cenários extras da spec e compara cada leitura com a referência transcrita do Excel:
+A equivalência **não faz parte do benchmark**: não mede desempenho. Ela confere se a API, rodando contra este ATP, calcula as 10 variáveis exatamente como o Excel. Para isso, ingere pela API os 6 casos do Excel e os cenários de borda da spec (janelas a ±1 s, faixas horárias, VU vazio, monto nulo × zero etc.) e compara cada leitura com a referência transcrita das fórmulas.
+
+Não é obrigatória, porque os mesmos cenários já rodam nos testes do projeto. Vale rodá-la **uma vez, na primeira instalação**, para confirmar que o ambiente da OCI (fuso, versão do banco, configuração) dá os mesmos números do desktop. Na janela 2:
 
 ```bash
 sentinela equivalencia --reset    # esperado: só linhas PASS (63) e código de saída 0
 ```
 
-## 6. Rodar o benchmark
+O `--reset` **esvazia `TRX`, `ABR` e `VU`**. Por isso, rode a equivalência **antes** do backfill, nunca entre o backfill e a carga.
 
-Rode na janela 2, **na raiz do projeto**, porque `./data` e `./logs` são relativos ao diretório atual. Os passos são os mesmos do `scripts/rodada.sh`, com os defaults dele:
+## 6. Rodar o benchmark sintético
+
+Tudo nesta seção usa **dados sintéticos**: a história é gerada pelo backfill, e os eventos da carga vêm dos arquivos gerados pelo `gerador`. Nenhum dado real é necessário.
+
+Rode na janela 2, **na raiz do projeto**, porque `./data` e `./logs` são relativos ao diretório atual. Os passos são os mesmos do `scripts/rodada.sh` ([README, seção 4.1](../README.md#41-rodada-automatizada)), com os defaults dele.
+
+### 6.1 Os quatro passos
 
 ```bash
-# 1. datasets: tps × duration × 1,1 eventos por fonte (600, 200 e 100 TPS por 300 s)
+# 1. datasets da carga: tps × duration × 1,1 eventos por fonte (600, 200 e 100 TPS por 300 s)
 sentinela gerador --dir ./data --clientes 100000 --seed 42 --trx 198000 --abr 66000 --vu 33000
 
 # 2. backfill: DESTRUTIVO para TRX, ABR e VU. 92 dias, 100 mil clientes (~16,5 milhões de linhas);
 #    no fim coleta estatísticas e confere o plano da leitura (código 4 se o plano for outro)
 sentinela backfill --clientes 100000 --seed 42 --trx-dia 1 --abr-dia 0.5 --vu-dia 0.3
 
-# 3. carga: três ingestores e o leitor em paralelo, por 300 s
+# 3. carga: três ingestores e o leitor em paralelo, por 300 s; grava os logs em ./logs
 taskset -c 12-15 sentinela carga --run oci-cheia --dir ./data \
     --tps-trx 600 --tps-abr 200 --tps-vu 100 --tps-read 600 --fracao-get 0.5 \
     --duration 300 --warmup 30 --clientes 100000 --seed 42 --concurrency 64
 
-# 4. relatório
+# 4. relatório: lê todos os logs de ./logs e grava em ./logs/report/
 sentinela relatorio ./logs
 cat logs/report/report.md
 ```
 
-O que cada fluxo da carga faz:
+| Passo | O que faz | Onde grava |
+| --- | --- | --- |
+| 1. `gerador` | Gera os eventos que a carga vai postar. Os IDs começam com `G` (TRX), `GA` (ABR) e `GV` (VU) | `data/trx.ndjson`, `data/abr.ndjson`, `data/vu.ndjson` |
+| 2. `backfill` | Esvazia as três tabelas e grava, direto no banco, 92 dias de história até agora. É a base que as leituras consultam | `TRX`, `ABR` e `VU` no ATP |
+| 3. `carga` | Posta os eventos do passo 1 pela API, com o instante trocado por agora, e lê as variáveis ao mesmo tempo | ATP (pela API) e logs em `./logs` |
+| 4. `relatorio` | Agrega os logs da carga em tabelas de latência e vazão | `logs/report/` |
+
+### 6.2 Logs da carga
+
+Cada processo da carga grava um CSV, com uma linha por requisição, e um `.meta.json` ao lado, com o TPS alvo, o warmup e a medição da fila:
 
 | Processo | Chamada | Log |
 | --- | --- | --- |
 | `ingestor_trx` / `ingestor_abr` / `ingestor_vu` | `POST /v1/<fonte>` com um evento do dataset, com o instante trocado por agora | `logs/ingestor_<fonte>-<run>.csv` |
 | `leitor` | `POST /v1/features` com uma compra sintética no instante atual; na fração `--fracao-get`, `GET /v1/features/{ID_TRX}` de uma TRX postada entre 5 e 65 s antes | `logs/leitor-<run>.csv` |
 
-O `--run` é **só o nome da rodada**: aparece nos nomes dos logs e no título "Execução oci-cheia" do relatório. Sem ele, o nome é um timestamp UTC. O relatório agrega todos os logs de `./logs`, então nomes distintos separam as rodadas.
+As colunas do CSV são `ts_epoch_ms, program, operation, cliente, latency_us, db_us, status`. `latency_us` é o tempo HTTP visto pelo simulador; `db_us` é o tempo da chamada ao Oracle medido na API.
 
-Rodada curta, para testar o ambiente antes da cheia (backfill de alguns minutos):
+O `--run` é **só o nome da rodada**: aparece nos nomes dos logs e no título "Execução oci-cheia" do relatório. Sem ele, o nome é um timestamp UTC. Use um nome diferente em cada rodada; com o mesmo nome, a nova sobrescreve os logs da anterior.
+
+### 6.3 Relatório
+
+O `sentinela relatorio ./logs` grava três arquivos em `logs/report/`:
+
+| Arquivo | Conteúdo |
+| --- | --- |
+| `report.md` | Uma tabela por rodada (`## Execução <run>`), com uma linha por programa e operação |
+| `report.csv` | Os mesmos números, para planilha |
+| `tps-series.csv` | Operações por segundo de cada programa, para ver se o TPS ficou estável ao longo da rodada |
+
+Cada linha do `report.md` traz:
+- ops, erros, taxa de erro, duração e TPS alvo e alcançado, sem o warmup;
+- **HTTP** avg, p95, p99 e max: tempo visto pelo simulador (rede, FastAPI e banco);
+- **DB** avg, p95, p99 e max: tempo da chamada ao Oracle medido na API (header `Server-Timing`).
+
+As duas leituras aparecem separadas, como `features_post` e `features_get`. As colunas de verificação dizem se a rodada vale:
+
+| Coluna | Passa quando |
+| --- | --- |
+| TPS ok | o TPS alcançado fica a menos de 5% do alvo |
+| Erro ok | a taxa de erro fica abaixo de 0,1% |
+| Fila ok | no máximo 1% das requisições sai com mais de 100 ms de atraso sobre o horário previsto. Se não passar, foi o simulador que não deu conta, e o TPS medido não é confiável |
+
+O relatório agrega **todos** os logs de `./logs`. Para um relatório só da rodada atual, mova os logs antigos antes: `mkdir -p logs/antigos && mv logs/*.csv logs/*.json logs/antigos/`.
+
+### 6.4 Rodada curta
+
+Para testar o ambiente antes da rodada cheia (o backfill leva poucos minutos):
 
 ```bash
 sentinela gerador --dir ./data --clientes 10000 --trx 6600 --abr 2000 --vu 1400
 sentinela backfill --clientes 10000
 taskset -c 12-15 sentinela carga --run oci-curta --dir ./data --tps-trx 100 --tps-abr 30 --tps-vu 20 \
     --tps-read 100 --duration 60 --warmup 10 --clientes 10000
+sentinela relatorio ./logs
 ```
 
-### 6.1 Rodadas seguintes
+Depois dela, refaça os passos 1 e 2 da seção 6.1 antes da rodada cheia. Os datasets da curta são pequenos demais (a carga pararia com código 4, dataset esgotado), e o backfill dela tem só 10 mil clientes.
 
-- **O mesmo dataset serve**, a menos que `tps × duration × 1,1` passe do que foi gerado. Nesse caso, gere de novo com contagens maiores.
-- **O backfill pode ser pulado**, mas antes apague o que a carga anterior gravou. Senão os mesmos `ID_TRX` (`G…`) e `ID_EVENTO` (`GA…`, `GV…`) voltam como repetidos e a rodada não mede inserção. Em SQL, como `SENTINELA`:
+### 6.5 Rodadas seguintes
 
-  ```sql
-  DELETE FROM trx WHERE id_trx LIKE 'G%';
-  DELETE FROM abr WHERE id_evento LIKE 'G%';
-  DELETE FROM vu  WHERE id_evento LIKE 'G%';
-  COMMIT;
-  ```
+O dataset é fixo: toda rodada posta **os mesmos eventos, com os mesmos IDs** (`G…`, `GA…`, `GV…`). Se esses IDs ainda estiverem no banco por causa da rodada anterior, a API não duplica nada: responde 200 ("repetido") em vez de 201 e não grava a linha. Mas então a rodada mede a deduplicação, não a inserção, e o resultado não é comparável. Por isso, **antes de cada rodada os eventos da carga anterior precisam sair do banco**. Há duas formas:
 
-- A equivalência esvazia as tabelas: depois dela, refaça o backfill.
+| | Refazer o backfill (recomendado) | Apagar só os eventos da carga |
+| --- | --- | --- |
+| Comando | `sentinela backfill ...` (passo 2 da seção 6.1) | os `DELETE` abaixo |
+| O que apaga | tudo: esvazia as três tabelas e recria os 92 dias | só as linhas da carga (`G…`); a história do backfill fica |
+| Tempo | minutos (16,5 milhões de linhas) | segundos |
+| Estatísticas e plano | recoleta e confere o plano | mantém os do último backfill |
+| Fim da história | agora | a hora do último backfill |
 
-### 6.2 Carregar dados reais
+Nenhuma das duas gera duplicidade, e as duas deixam o banco no mesmo ponto de partida. O `DELETE` **não equivale** ao backfill: ele remove só os poucos milhares de linhas da carga e preserva a história, enquanto o backfill apaga tudo e grava a história de novo.
 
-```bash
-sentinela importar --fonte trx --arquivo trx.csv --sep ';' --modo api       # pelos endpoints de lote
-sentinela importar --fonte abr --arquivo abr.ndjson --modo direto           # em massa, direto no ATP
+A diferença que importa é o fim da história. O backfill grava 92 dias **até o instante em que roda**, e a carga posta eventos no instante atual. Se a próxima rodada for horas ou dias depois do backfill, fica um intervalo sem história entre os dois, e as janelas mais curtas das variáveis ficam mais vazias que na primeira rodada. Use o `DELETE` só para repetir uma rodada **logo em seguida**. Em qualquer outro caso, ou na dúvida, refaça o backfill.
+
+O `DELETE`, como `SENTINELA`. Ele não toca a história, porque o backfill usa IDs `B…` em TRX e grava ABR e VU sem `ID_EVENTO`:
+
+```sql
+DELETE FROM trx WHERE id_trx LIKE 'G%';
+DELETE FROM abr WHERE id_evento LIKE 'G%';
+DELETE FROM vu  WHERE id_evento LIKE 'G%';
+COMMIT;
 ```
 
-Os dois modos validam com os mesmos modelos da API; linhas inválidas aparecem com o número da linha e o campo. Detalhes no [README, seção 4.4](../README.md#44-dados-reais-importar).
-
-### 6.3 Job diário
-
-```bash
-sentinela job-diario                 # remove partições com mais de 93 dias, até D-1
-sentinela job-diario --day 2026-11-05
-```
+O mesmo dataset serve para as rodadas seguintes, a menos que `tps × duration × 1,1` passe do que foi gerado. Nesse caso, gere de novo com contagens maiores (seção 7).
 
 ## 7. Escalando a carga
 
