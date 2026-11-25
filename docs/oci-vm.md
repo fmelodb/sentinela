@@ -1,6 +1,6 @@
 # Rodando a POC na OCI sem containers (VM + Autonomous Database)
 
-Neste modo, a API e o simulador rodam **direto na VM Linux**, num virtualenv Python, sem podman. O banco é um Autonomous Database (ATP) 26ai. Os programas são os mesmos do modo com containers ([oci.md](oci.md)); muda só a forma de chamá-los: `sentinela <programa>` no shell, em vez de `podman exec ... sentinela <programa>`.
+Neste modo, a API e o simulador rodam **direto na VM Linux**,  num virtualenv Python, sem podman. O banco é um Autonomous Database (ATP) 26ai. Os programas são os mesmos do modo com containers ([oci.md](oci.md)); muda só a forma de chamá-los: `sentinela <programa>` no shell, em vez de `podman exec ... sentinela <programa>`.
 
 ```
 ┌──────────── VCN / subnet privada ─────────────┐
